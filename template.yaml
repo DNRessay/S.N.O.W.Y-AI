@@ -1,0 +1,448 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  SNOWY — personal AI assistant. Light tier (chat, Lambda Function URL)
+  + Medium tier (scheduled PULSE tick). No API Gateway (avoids its 12-month
+  free-tier cliff), no NAT gateway, no always-on compute — designed to cost
+  a few rand a month for a single user.
+
+Parameters:
+  SnowyEnabled:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: "Master switch (GitHub variable SNOWY_ENABLED). false = chat refuses requests and the scheduled tick is disabled."
+  GroqApiKey:
+    Type: String
+    NoEcho: true
+  GroqModel:
+    Type: String
+    Default: qwen/qwen3.8-27b
+  GroqPlanningModel:
+    Type: String
+    Default: openai/gpt-oss-120b
+  CohereApiKey:
+    Type: String
+    NoEcho: true
+    Default: ""
+    Description: >
+      Optional — Cohere's free Trial key, used only as a fallback when Groq's own rate limit
+      isn't worth retrying through (see pipeline/query_engine.py's RateLimitError path).
+      Blank disables the fallback entirely; the old "try again in ~N minutes" message still works.
+  CohereModel:
+    Type: String
+    Default: command-a-03-2025
+  LocalLlmUrl:
+    Type: String
+    Default: ""
+    Description: >
+      Optional — URL of the self-hosted Bonsai 2 27B endpoint (modal_app/llm.py), tried before Cohere
+      when Groq's quota runs out. Blank disables it.
+  LocalLlmApiKey:
+    Type: String
+    NoEcho: true
+    Default: ""
+    Description: "Must match the LLM_API_KEY value in the snowy-llm-secret Modal secret"
+  GeminiApiKey:
+    Type: String
+    NoEcho: true
+    Default: ""
+    Description: "Optional - Google AI Studio key: Gemini free tier, Nano Banana images, Gemini TTS"
+  AnthropicApiKey:
+    Type: String
+    NoEcho: true
+    Default: ""
+    Description: "Optional - Paid: Claude in the model picker"
+  OpenaiApiKey:
+    Type: String
+    NoEcho: true
+    Default: ""
+    Description: "Optional - Paid: GPT in the model picker"
+  QwenApiKey:
+    Type: String
+    NoEcho: true
+    Default: ""
+    Description: "Optional - Paid: Qwen via Alibaba Cloud Model Studio (DashScope)"
+  DeepseekApiKey:
+    Type: String
+    NoEcho: true
+    Default: ""
+    Description: "Optional - Paid: DeepSeek in the model picker"
+  KimiApiKey:
+    Type: String
+    NoEcho: true
+    Default: ""
+    Description: "Optional - Paid: Kimi (Moonshot) in the model picker"
+  HfToken:
+    Type: String
+    NoEcho: true
+    Default: ""
+    Description: "Optional - Hugging Face token: any model on HF's Inference Providers router"
+  ModalVideoUrl:
+    Type: String
+    Default: ""
+    Description: "Optional - URL of modal_app/video.py (Design tab video ads)"
+  ModalVideoSecret:
+    Type: String
+    NoEcho: true
+    Default: ""
+    Description: "Must match VIDEO_SECRET in the snowy-video-secret Modal secret"
+  SearxngUrl:
+    Type: String
+    Default: ""
+    Description: "Optional - a SearXNG server for keyless web search"
+  OwnerWhatsappNumber:
+    Type: String
+    Default: ""
+    Description: "Optional - your WhatsApp number (international, no +) for reminders and the morning brief"
+  PulseBriefHour:
+    Type: String
+    Default: "7"
+    Description: "Hour (South Africa time, 0-23) for the daily morning brief"
+  NeonDatabaseUrl:
+    Type: String
+    NoEcho: true
+    Description: "Neon Postgres connection string, e.g. postgresql://user:pass@host/db?sslmode=require"
+  ModalEmbeddingsUrl:
+    Type: String
+    Default: ""
+    Description: "URL of the deployed Modal embeddings endpoint (modal_app/embeddings.py)"
+  ModalRepoUrl:
+    Type: String
+    Default: ""
+    Description: "URL of the deployed Modal persistent repo clone/read/grep endpoint (modal_app/repo_tool.py)"
+  ModalRepoSecret:
+    Type: String
+    NoEcho: true
+    Default: ""
+    Description: "Shared secret sent as Bearer auth to ModalRepoUrl — must match the Modal secret's REPO_TOOL_SECRET value"
+  SecretKey:
+    Type: String
+    NoEcho: true
+    Description: "Shared secret the frontend sends as x-api-key for TRUSTED trust mode"
+  SerpApiKey:
+    Type: String
+    NoEcho: true
+    Default: ""
+  WhatsappToken:
+    Type: String
+    NoEcho: true
+    Default: ""
+    Description: "Meta Graph API access token for the WhatsApp Business Cloud API (outbound sends)"
+  WhatsappPhoneId:
+    Type: String
+    Default: ""
+    Description: "WhatsApp Business phone number ID, from the Meta App Dashboard"
+  WhatsappVerifyToken:
+    Type: String
+    NoEcho: true
+    Default: ""
+    Description: "Arbitrary string also entered in the Meta App Dashboard's webhook Verify Token field"
+  GithubWebhookSecret:
+    Type: String
+    NoEcho: true
+    Default: ""
+    Description: "Secret entered in the GitHub repo's webhook settings; signatures are checked when set"
+  OpenclawUrl:
+    Type: String
+    Default: ""
+    Description: "Optional self-hosted OpenClaw gateway URL (WhatsApp/Telegram bridge)"
+  OpenclawWebhookSecret:
+    Type: String
+    NoEcho: true
+    Default: ""
+    Description: "Bearer token OpenClaw sends to /webhook/openclaw; the webhook refuses everything until it's set"
+  WhatsappAppSecret:
+    Type: String
+    NoEcho: true
+    Default: ""
+    Description: "Meta app secret; inbound WhatsApp messages are only answered when Meta's signature checks out"
+  ResetEmails:
+    Type: String
+    NoEcho: true
+    Default: ""
+    Description: "Comma-separated emails allowed to receive a passphrase reset link"
+  MediaBucket:
+    Type: String
+    Default: "snowy-media-<account-id>"
+    Description: "Existing private bucket for ad images and videos; its lifecycle rule deletes them after 7 days"
+  SesFromEmail:
+    Type: String
+    Default: "SNOWY <noreply@example.com>"
+    Description: "Verified SES sender for reset emails"
+  McpServers:
+    Type: String
+    Default: ""
+    Description: >
+      Optional JSON object of name -> base_url registered with the "mcp" tool at startup,
+      e.g. {"slack": "https://my-slack-mcp.example.com"}
+  GithubClientId:
+    Type: String
+    Default: ""
+    Description: "GitHub OAuth App client ID (github.com/settings/developers) — blank disables GitHub OAuth, manual PAT paste still works"
+  GithubClientSecret:
+    Type: String
+    NoEcho: true
+    Default: ""
+  GitlabClientId:
+    Type: String
+    Default: ""
+    Description: "GitLab OAuth App client ID (gitlab.com/-/user_settings/applications) — blank disables GitLab OAuth, manual PAT paste still works"
+  GitlabClientSecret:
+    Type: String
+    NoEcho: true
+    Default: ""
+  GoogleClientId:
+    Type: String
+    Default: ""
+    Description: >
+      Google OAuth client ID (console.cloud.google.com > APIs & Services > Credentials) for
+      Calendar/Gmail/Drive/Contacts — blank disables the Google connector entirely (no manual-token
+      fallback exists for Google the way it does for GitHub/GitLab PATs).
+  GoogleClientSecret:
+    Type: String
+    NoEcho: true
+    Default: ""
+  PublicApiUrl:
+    Type: String
+    Default: ""
+    Description: >
+      This stack's own ChatFunctionUrl value (same as the frontend's VITE_API_URL) — needed to build
+      the exact OAuth redirect_uri. Can't be !GetAtt'd here: that would be a circular reference on the
+      same resource whose Environment this sets, so it's a plain parameter carrying the already-known
+      Function URL instead.
+
+Conditions:
+  IsEnabled: !Equals [!Ref SnowyEnabled, "true"]
+
+Globals:
+  Function:
+    Runtime: python3.13
+    Architectures: [x86_64]  # matches GitHub Actions runners natively — arm64/Graviton
+                              # needs cross-arch container emulation (QEMU) in CI, which
+                              # GitHub-hosted runners don't reliably have; not worth the
+                              # ~20% compute saving when usage is already ~$0/month
+    Timeout: 30
+    MemorySize: 512
+    Environment:
+      Variables:
+        GROQ_API_KEY: !Ref GroqApiKey
+        GROQ_MODEL: !Ref GroqModel
+        GROQ_PLANNING_MODEL: !Ref GroqPlanningModel
+        COHERE_API_KEY: !Ref CohereApiKey
+        COHERE_MODEL: !Ref CohereModel
+        LOCAL_LLM_URL: !Ref LocalLlmUrl
+        LOCAL_LLM_API_KEY: !Ref LocalLlmApiKey
+        GEMINI_API_KEY: !Ref GeminiApiKey
+        ANTHROPIC_API_KEY: !Ref AnthropicApiKey
+        OPENAI_API_KEY: !Ref OpenaiApiKey
+        QWEN_API_KEY: !Ref QwenApiKey
+        DEEPSEEK_API_KEY: !Ref DeepseekApiKey
+        KIMI_API_KEY: !Ref KimiApiKey
+        HF_TOKEN: !Ref HfToken
+        MODAL_VIDEO_URL: !Ref ModalVideoUrl
+        MODAL_VIDEO_SECRET: !Ref ModalVideoSecret
+        SEARXNG_URL: !Ref SearxngUrl
+        OWNER_WHATSAPP_NUMBER: !Ref OwnerWhatsappNumber
+        PULSE_BRIEF_HOUR: !Ref PulseBriefHour
+        NEON_DATABASE_URL: !Ref NeonDatabaseUrl
+        MODAL_EMBEDDINGS_URL: !Ref ModalEmbeddingsUrl
+        MODAL_REPO_URL: !Ref ModalRepoUrl
+        MODAL_REPO_SECRET: !Ref ModalRepoSecret
+        CACHE_TABLE_NAME: !Ref CacheTable
+        SECRET_KEY: !Ref SecretKey
+        SERP_API_KEY: !Ref SerpApiKey
+        WHATSAPP_TOKEN: !Ref WhatsappToken
+        WHATSAPP_PHONE_ID: !Ref WhatsappPhoneId
+        WHATSAPP_VERIFY_TOKEN: !Ref WhatsappVerifyToken
+        GITHUB_WEBHOOK_SECRET: !Ref GithubWebhookSecret
+        OPENCLAW_URL: !Ref OpenclawUrl
+        OPENCLAW_WEBHOOK_SECRET: !Ref OpenclawWebhookSecret
+        WHATSAPP_APP_SECRET: !Ref WhatsappAppSecret
+        RESET_EMAILS: !Ref ResetEmails
+        SES_FROM_EMAIL: !Ref SesFromEmail
+        MEDIA_BUCKET: !Ref MediaBucket
+        MCP_SERVERS: !Ref McpServers
+        GITHUB_CLIENT_ID: !Ref GithubClientId
+        GITHUB_CLIENT_SECRET: !Ref GithubClientSecret
+        GITLAB_CLIENT_ID: !Ref GitlabClientId
+        GITLAB_CLIENT_SECRET: !Ref GitlabClientSecret
+        GOOGLE_CLIENT_ID: !Ref GoogleClientId
+        GOOGLE_CLIENT_SECRET: !Ref GoogleClientSecret
+        PUBLIC_API_URL: !Ref PublicApiUrl
+        SNOWY_ENABLED: !Ref SnowyEnabled
+
+Resources:
+  ChatFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: snowy-chat
+      CodeUri: ./
+      Handler: run.sh
+      # Runs directly under uvicorn via AWS Lambda Web Adapter, in
+      # RESPONSE_STREAM invoke mode. A plain Function URL only supports
+      # InvokeMode: BUFFERED behind a Mangum-wrapped ASGI handler — the
+      # whole response gets collected before any of it reaches the client,
+      # so /chat's StreamingResponse (gateway/router.py) never actually
+      # streamed to the browser. The Web Adapter runs the app as a real
+      # long-lived HTTP server behind Lambda's native streaming invoke API
+      # instead, so chunks flush as Groq produces them. (This used to be
+      # the Description field below, but AWS::Lambda::Function.Description
+      # has a hard 256-char limit — CFN's early-validation hook was
+      # correctly rejecting it at 622 chars, not a false positive.)
+      Description: "Light tier — FastAPI (chat/status/webhooks) via uvicorn + AWS Lambda Web Adapter, RESPONSE_STREAM invoke mode"
+      # Lambda gives CPU in proportion to memory: at 512 MB a cold start took ~9 s before the first reply could
+      # begin. 1536 MB gives about three times the CPU, so start-up and every reply are quicker; it's billed per
+      # millisecond, so shorter runs offset most of the higher rate.
+      MemorySize: 1536
+      # Lambda's 15-minute maximum: a Code tab run (agents/code_agent.py)
+      # loops for up to 13 minutes, and a chat reply from the self-hosted
+      # model can wait out its GPU cold start. Lambda bills per millisecond
+      # actually run, so the ceiling costs nothing on normal replies.
+      Timeout: 900
+      Layers:
+        - !Sub arn:aws:lambda:${AWS::Region}:753240598075:layer:LambdaAdapterLayerX86:28
+      Environment:
+        Variables:
+          AWS_LAMBDA_EXEC_WRAPPER: /opt/bootstrap
+          AWS_LWA_INVOKE_MODE: response_stream
+          PORT: "8000"
+      FunctionUrlConfig:
+        AuthType: NONE      # app-level auth: Bearer login tokens signed with SECRET_KEY (gateway/auth.py)
+        InvokeMode: RESPONSE_STREAM
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref CacheTable
+        # Ad images and video ads (tools/media_store.py): only this bucket's objects.
+        - Statement:
+            - Effect: Allow
+              Action:
+                - s3:PutObject
+                - s3:GetObject
+              Resource: !Sub "arn:aws:s3:::${MediaBucket}/*"
+        # Passphrase reset emails (gateway/reset_router.py), only from your verified domain.
+        - Statement:
+            - Effect: Allow
+              Action:
+                - ses:SendEmail
+                - ses:SendRawEmail
+              Resource: "*"
+              Condition:
+                StringLike:
+                  ses:FromAddress: "*@example.com"
+        # Sem Code's read-only AWS tool (tools/aws_read_tool.py): see what's
+        # deployed (share this account) and read their logs.
+        # Metadata only — the tool itself also refuses secret-returning calls.
+        - arn:aws:iam::aws:policy/job-function/ViewOnlyAccess
+        - Statement:
+            - Effect: Allow
+              Action:
+                - lambda:GetFunctionConfiguration
+                - logs:FilterLogEvents
+                - logs:GetLogEvents
+                - cloudwatch:GetMetricStatistics   # AWS/Billing EstimatedCharges, for the bill in chat
+              Resource: "*"
+        - Statement:
+            - Effect: Allow
+              Action:
+                - lambda:GetFunctionConfiguration
+                - lambda:GetFunction
+                - logs:FilterLogEvents
+                - logs:GetLogEvents
+                - logs:DescribeLogGroups
+                - logs:DescribeLogStreams
+                - logs:StartQuery
+                - logs:GetQueryResults
+                - cloudformation:DescribeStackEvents
+                - cloudformation:GetTemplate
+                - xray:GetTraceSummaries
+                - xray:BatchGetTraces
+                - cloudwatch:GetMetricStatistics   # AWS/Billing EstimatedCharges, for the bill in chat
+              Resource: "*"
+            # Owner-approved changes: each still waits for an Approve tap. No IAM, no billing.
+            - Effect: Allow
+              Action:
+                - lambda:UpdateFunctionConfiguration
+                - lambda:UpdateFunctionCode
+                - lambda:PublishVersion
+                - lambda:InvokeFunction
+              Resource: !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:*"
+            - Effect: Allow
+              Action:
+                - s3:CreateBucket
+                - s3:PutObject
+                - s3:DeleteObject
+                - s3:PutBucketVersioning
+                - s3:PutBucketTagging
+              Resource:
+                - !Sub "arn:${AWS::Partition}:s3:::*"
+                - !Sub "arn:${AWS::Partition}:s3:::*/*"
+  ChatFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${ChatFunction}
+      RetentionInDays: 14  # Lambda's auto-created log group defaults to "never expire" — a slow, silent cost creep otherwise
+
+  TickFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: snowy-tick
+      CodeUri: ./
+      Handler: tick_handler.handler
+      Description: "Medium tier — one PULSE tick + a CONSOLIDATOR gate check per schedule firing, replacing the Heavy-tier daemon loop"
+      # PULSE alone needs only its old 20s — but when CONSOLIDATOR's gate passes
+      # (rare: 24hr + 5 sessions), phase_index re-embeds up to 500 memories
+      # one Modal HTTP call at a time, which can run well past 20s. 300s
+      # gives real headroom for that while staying comfortably under the
+      # 15-minute schedule interval (so one tick finishes before the next
+      # fires) and far under Lambda's 900s hard ceiling.
+      # 900s: a due Code tab automation (pipeline/code_tasks.py) gets up
+      # to 10 minutes of agent time on top of PULSE/CONSOLIDATOR.
+      Timeout: 900
+      MemorySize: 256
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref CacheTable
+        # Finishing videos (design_router.advance_all): presigned uploads and copying a joined video to S3.
+        - Statement:
+            - Effect: Allow
+              Action:
+                - s3:PutObject
+                - s3:GetObject
+              Resource: !Sub "arn:aws:s3:::${MediaBucket}/*"
+      Events:
+        ScheduledTick:
+          Type: Schedule
+          Properties:
+            Schedule: rate(15 minutes)
+            State: !If [IsEnabled, ENABLED, DISABLED]
+
+  TickFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${TickFunction}
+      RetentionInDays: 14
+
+  CacheTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: snowy-cache
+      BillingMode: PAY_PER_REQUEST  # traffic is tiny for one user; on-demand costs fractions of a cent/month
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+Outputs:
+  ChatFunctionUrl:
+    Description: "Public HTTPS endpoint for the chat API — set as VITE_API_URL in the frontend"
+    Value: !GetAtt ChatFunctionUrl.FunctionUrl
+  TickFunctionName:
+    Value: !Ref TickFunction
+  CacheTableName:
+    Value: !Ref CacheTable

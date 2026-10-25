@@ -1,0 +1,104 @@
+import logging
+import os
+from contextlib import asynccontextmanager
+
+from fastapi import Depends, FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+from cache.sys_cache import SysCache
+from config import settings
+from gateway.bots_router import public as bots_webhooks
+from gateway.bots_router import router as bots_router
+from gateway.code_router import router as code_router
+from gateway.compact_router import router as compact_router
+from gateway.connectors import router as connectors_router
+from gateway.cowork_router import router as cowork_router
+from gateway.design_router import router as design_router
+from gateway.finance_router import router as finance_router
+from gateway.google_oauth import router as google_oauth_router
+from gateway.mcp_router import router as mcp_router
+from gateway.media_router import router as media_router
+from gateway.oauth_router import router as oauth_router
+from gateway.openai_compat import router as openai_router
+from gateway.power import guard as power_guard
+from gateway.power import router as power_router
+from gateway.reset_router import router as reset_router
+from gateway.router import router
+from gateway.runs_router import router as runs_router
+from gateway.settings_router import router as settings_router
+from gateway.skills import router as skills_router
+from gateway.webhooks import webhook_router
+from storage.neon_store import get_store
+
+sys_cache = SysCache()
+
+# Pulse is a Heavy-tier always-on daemon (infinite loop) — it cannot run inside
+# a Lambda execution environment, which freezes between invocations. In Lambda,
+# the equivalent "tick" is triggered on a schedule instead — see tick_handler.py
+# and the EventBridge rule in template.yaml.
+_IS_LAMBDA = bool(os.environ.get("AWS_LAMBDA_FUNCTION_NAME"))
+
+# SECRET_KEY signs every login token: with the default anyone could mint their own, so refuse to start.
+if _IS_LAMBDA and settings.SECRET_KEY in ("", "change-me"):
+    raise RuntimeError("SECRET_KEY is unset: set the SNOWY_SECRET_KEY GitHub secret (32+ random characters)")
+if _IS_LAMBDA and len(settings.SECRET_KEY) < 32:
+    logging.warning("SECRET_KEY is shorter than 32 characters; rotate SNOWY_SECRET_KEY to a longer random value")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await get_store()
+    sys_cache.warm()
+
+    pulse_task = None
+    if not _IS_LAMBDA:
+        import asyncio
+
+        from agents.pulse import PulseDaemon
+        pulse = PulseDaemon()
+        pulse_task = asyncio.create_task(pulse.start())
+
+    yield
+
+    if pulse_task:
+        pulse.stop()
+        pulse_task.cancel()
+
+    store = await get_store()
+    await store.close()
+
+
+app = FastAPI(title="SNOWY", lifespan=lifespan, dependencies=[Depends(power_guard)])
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.include_router(router)
+# google_oauth_router before connectors_router: connectors.py's generic
+# GET /connectors/{provider}/authorize and /callback are parameterized
+# routes that would otherwise match "google" as a valid {provider} value
+# and shadow these more specific literal routes — Starlette matches in
+# registration order, so the more specific one has to come first.
+app.include_router(google_oauth_router)
+app.include_router(connectors_router)
+app.include_router(skills_router)
+app.include_router(webhook_router)
+app.include_router(code_router)
+app.include_router(media_router)
+app.include_router(cowork_router)
+app.include_router(bots_router)
+app.include_router(bots_webhooks)
+app.include_router(design_router)
+app.include_router(mcp_router)
+app.include_router(oauth_router)
+app.include_router(settings_router)
+app.include_router(finance_router)
+app.include_router(compact_router)
+app.include_router(openai_router)
+app.include_router(runs_router)
+app.include_router(reset_router)
+app.include_router(power_router)

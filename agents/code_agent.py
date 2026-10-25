@@ -1,0 +1,270 @@
+from agents.tool_loop import ToolLoopAgent, fn_tool
+from config import settings
+from tools.aws_read_tool import AwsReadTool
+from tools.code_workspace import CodeWorkspace
+
+_SYSTEM = """You are Sem Code, SNOWY's coding agent. You work inside a git clone of {repo} ({provider}).
+Every path is relative to the repo root; bash runs with the repo root as its working directory.
+
+How to work:
+- Explore before changing anything: list_dir, grep, read_file.
+- Prefer edit_file for changes to existing files (copy `old` exactly from what read_file returned). Use write_file for new files.
+- Verify with bash: run the project's tests, linter or a quick script. Install dependencies with pip/npm if needed.
+- Keep changes minimal and focused on the request. Don't reformat unrelated code.
+- Never run git commit, checkout, branch, reset or push yourself. {pr_line}
+- Never print or write secrets, tokens or API keys.
+- Finish with a short summary: what you changed, and how you verified it (or why you couldn't).
+You are SNOWY running on open-weight models; never claim to be Claude, GPT or any other vendor's model."""
+
+_AUTOPILOT_SUFFIX = """
+
+AUTOPILOT MODE: pushing to this chat's own branch, opening/updating its PR and re-running CI happen without asking. Merges,
+secrets, workflow runs and AWS changes still wait for the user's approval."""
+
+_PLAN_SUFFIX = """
+
+PLAN MODE: do not modify anything. Only explore (list_dir, read_file, grep, aws). Then reply with a numbered,
+concrete implementation plan: which files change and how, and how you'll verify it. The user approves before you act."""
+
+
+# Code-tab actions that change things outside the workspace: queued for a
+# one-tap approval in the UI, then run here by /code/execute.
+APPROVAL_ACTIONS = {"merge_pr", "push_branch", "run_workflow", "rerun_ci", "set_secret", "aws_action"}
+
+
+def describe_action(name: str, args: dict, repo: str) -> str:
+    if name == "merge_pr":
+        return f"Merge #{args.get('number')} in {repo} ({args.get('method') or 'merge'})"
+    if name == "push_branch":
+        return f"Push the workspace changes to {repo}@{args.get('branch') or 'the default branch'}"
+    if name == "run_workflow":
+        return f"Run {args.get('workflow') or 'the pipeline'} on {repo}@{args.get('ref')}"
+    if name == "rerun_ci":
+        return f"Re-run CI run {args.get('run_id')} in {repo}"
+    if name == "set_secret":
+        return f"Set secret {args.get('name')} in {repo} (value hidden)"
+    if name == "aws_action":
+        from tools.aws_action import classify
+        flags = classify(args.get("service", ""), args.get("operation", ""))
+        where = f" in {args['region']}" if args.get("region") else ""
+        return " ".join([*flags, f"AWS {args.get('service')} {args.get('operation')}{where}"])
+    return name
+
+
+_S = {"type": "string"}
+TOOLS = {
+    "list_dir": fn_tool("list_dir", "List a directory in the repo ('' for the root).", {"path": _S}, []),
+    "read_file": fn_tool("read_file", "Read a text file (up to 20,000 chars).", {"path": _S}, ["path"]),
+    "grep": fn_tool("grep", "Case-insensitive search across tracked files; returns path:line matches.", {"pattern": _S}, ["pattern"]),
+    "write_file": fn_tool("write_file", "Create or overwrite a file with the full content.", {"path": _S, "content": _S}, ["path", "content"]),
+    "edit_file": fn_tool(
+        "edit_file", "Replace an exact snippet in a file. `old` must match exactly once unless replace_all is true.",
+        {"path": _S, "old": _S, "new": _S, "replace_all": {"type": "boolean"}}, ["path", "old", "new"],
+    ),
+    "bash": fn_tool(
+        "bash", "Run a shell command in the repo root (tests, linters, installs, git status/diff). Max 120s.",
+        {"command": _S, "timeout": {"type": "integer"}}, ["command"],
+    ),
+    "open_pr": fn_tool(
+        "open_pr", "Commit every changed file to a new branch and open a pull/merge request. Use when the user "
+        "asks for a PR or commit, after verifying your changes.", {"title": _S, "body": _S}, ["title"],
+    ),
+    # Repo hosting (GitHub / GitLab) — need the connected token.
+    "list_prs": fn_tool("list_prs", "List pull/merge requests (state: open, closed or all).", {"state": _S}, []),
+    "pr_status": fn_tool("pr_status", "One PR/MR: state, whether it can merge, and its checks/pipeline.",
+                         {"number": {"type": "integer"}}, ["number"]),
+    "list_workflows": fn_tool("list_workflows", "List the repo's CI workflows (GitHub Actions) or pipeline info (GitLab).", {}, []),
+    "list_ci_runs": fn_tool("list_ci_runs", "Recent CI runs/pipelines with status.", {"limit": {"type": "integer"}}, []),
+    "ci_logs": fn_tool("ci_logs", "Log tails of a CI run's failed jobs.", {"run_id": {"type": "integer"}}, ["run_id"]),
+    "list_secrets": fn_tool("list_secrets", "Names of the repo's CI secrets/variables (never values).", {}, []),
+    "merge_pr": fn_tool("merge_pr", "Merge a PR/MR (method: merge, squash or rebase). Waits for the user's approval.",
+                        {"number": {"type": "integer"}, "method": _S}, ["number"]),
+    "push_branch": fn_tool("push_branch", "Commit every changed file straight to a branch (created if missing; empty = "
+                           "default branch) without a PR. Waits for the user's approval.",
+                           {"branch": _S, "message": _S}, ["message"]),
+    "run_workflow": fn_tool("run_workflow", "Start a GitHub workflow (file name like deploy.yml) or a GitLab pipeline on a "
+                            "ref, with optional inputs. Waits for the user's approval.",
+                            {"ref": _S, "workflow": _S, "inputs": {"type": "object"}}, ["ref"]),
+    "rerun_ci": fn_tool("rerun_ci", "Re-run a CI run's failed jobs / retry a pipeline. Waits for the user's approval.",
+                        {"run_id": {"type": "integer"}}, ["run_id"]),
+    "set_secret": fn_tool("set_secret", "Create or update a CI secret/variable. Only with a value the user gave you. "
+                          "Waits for the user's approval.", {"name": _S, "value": _S}, ["name", "value"]),
+    "aws_action": fn_tool(
+        "aws_action", "Change something in AWS (any boto3 write operation, e.g. lambda UpdateFunctionConfiguration). "
+        "Always waits for the user's approval; say what it costs if it creates anything that runs or bills monthly, "
+        "and prefer the cheapest option.",
+        {"service": _S, "operation": _S, "params": {"type": "object"}, "region": _S}, ["service", "operation"],
+    ),
+    "deep_research": fn_tool(
+        "deep_research", "Research a question on the web properly (several searches, reads docs/issues, cross-checks) "
+        "and get a cited answer — library APIs, error messages, best practice. Takes a minute or two.",
+        {"question": _S}, ["question"],
+    ),
+    "aws": fn_tool(
+        "aws", "Read-only AWS call via boto3 (Describe*/List*/Get* only), e.g. service='lambda', operation='ListFunctions'.",
+        {"service": _S, "operation": _S, "params": {"type": "object"}, "region": _S}, ["service", "operation"],
+    ),
+}
+_NOT_REPO_SCOPED = {"aws", "aws_action", "deep_research"}
+_READ_ONLY = ("list_dir", "read_file", "grep", "aws", "deep_research", "list_prs", "pr_status", "list_workflows", "list_ci_runs",
+              "ci_logs", "list_secrets")
+_HOST_TOOLS = {"open_pr", "list_prs", "pr_status", "list_workflows", "list_ci_runs", "ci_logs", "list_secrets",
+               "merge_pr", "push_branch", "run_workflow", "rerun_ci", "set_secret"}
+
+
+class CodeAgent(ToolLoopAgent):
+    """The Code tab's agent: works in a clone of one repo on Modal. Plan mode
+    only offers the read-only tools."""
+
+    def __init__(self, workspace: CodeWorkspace, mode: str = "act", max_steps: int | None = None,
+                 deadline_seconds: float | None = None, aws: AwsReadTool | None = None, provider: str = "auto",
+                 mcp=None, pr_token: str | None = None, branch: str = "",
+                 others: list[CodeWorkspace] | None = None, tokens: dict | None = None):
+        # MCP tools have unknown side effects, so plan mode never gets them.
+        super().__init__(provider, max_steps or settings.CODE_MAX_STEPS,
+                         deadline_seconds or settings.AGENT_TIMEOUT_SECONDS, mcp=None if mode == "plan" else mcp)
+        self.tab = "code"
+        self.ws = workspace
+        self.mode = mode if mode in ("plan", "autopilot") else "act"
+        self.aws = aws or AwsReadTool()
+        self.pending: dict[str, dict] = {}  # approval id -> real action, for /code/execute
+        # More repos in the same chat: tools take repo="owner/name"; the first one is the default.
+        self.workspaces = {w.repo: w for w in [workspace, *(others or [])]}
+        # Connected GitHub/GitLab token per provider; repo-host tools are only offered when set.
+        self.tokens = {k: v for k, v in (tokens or {workspace.provider: pr_token}).items() if v}
+        self.branch = branch  # this chat's working branch: every PR/push from it goes here
+
+    @property
+    def pr_token(self) -> str | None:
+        return self.tokens.get(self.ws.provider)
+
+    def tools(self) -> list[dict]:
+        names = _READ_ONLY if self.mode == "plan" else tuple(TOOLS)
+        picked = [TOOLS[n] for n in names if n not in _HOST_TOOLS or self.tokens]
+        if len(self.workspaces) == 1:
+            return picked
+        repo_prop = {"type": "string", "enum": list(self.workspaces),
+                     "description": f"Which repo (default {self.ws.repo})"}
+        return [t if t["function"]["name"] in _NOT_REPO_SCOPED else {**t, "function": {**t["function"], "parameters": {
+            **t["function"]["parameters"], "properties": {**t["function"]["parameters"]["properties"], "repo": repo_prop}}}}
+            for t in picked]
+
+    def system_prompt(self) -> str:
+        pr_line = ("When the user asks for a PR or commit, call open_pr: it commits everything you changed to a new branch "
+                   "and opens the PR, then share its link. You can also check PRs/MRs, CI runs and logs and secret names; "
+                   "merging, pushing, running workflows and setting secrets go to the user as a one-tap approval — say "
+                   "it's waiting for them." if self.pr_token else
+                   f"Opening a PR needs {self.ws.provider} connected in Connectors; until then the user can review "
+                   "your changes with the Changes button.")
+        if self.branch:
+            pr_line += (f" This chat's work branch is {self.branch}: open_pr commits there and reuses its PR, and "
+                        "push_branch with no branch pushes there too.")
+        if len(self.workspaces) > 1:
+            pr_line += (" This chat has several repos: " + ", ".join(f"{w.repo} ({w.provider})" for w in self.workspaces.values())
+                        + f". Pass repo=\"owner/name\" to any file, bash, PR or CI tool to work in one other than {self.ws.repo}; "
+                        "each repo gets its own PR on this chat's branch.")
+        system = _SYSTEM.format(repo=self.ws.repo, provider=self.ws.provider, pr_line=pr_line)
+        return system + {"plan": _PLAN_SUFFIX, "autopilot": _AUTOPILOT_SUFFIX}.get(self.mode, "")
+
+    def _target(self, args: dict) -> CodeWorkspace:
+        return self.workspaces.get((args or {}).get("repo") or "", self.ws)
+
+    async def dispatch(self, name: str, args: dict) -> dict:
+        target = self._target(args)
+        args = {k: v for k, v in args.items() if k != "repo"}
+        if target is self.ws:
+            return await self._dispatch(name, args)
+        primary, self.ws = self.ws, target  # tool calls run one at a time, so switching the default is safe
+        try:
+            return await self._dispatch(name, args)
+        finally:
+            self.ws = primary
+
+    async def _dispatch(self, name: str, args: dict) -> dict:
+        if self.mode == "plan" and name not in _READ_ONLY:
+            return {"ok": False, "error": "plan mode is read-only"}
+        if name == "deep_research":
+            from agents.research_agent import deep_research
+            return await deep_research(args.get("question", ""), self.provider)
+        if name == "list_dir":
+            return await self.ws.list_dir(args.get("path", ""))
+        if name == "read_file":
+            return await self.ws.read_file(args.get("path", ""))
+        if name == "grep":
+            return await self.ws.grep(args.get("pattern", ""))
+        if name == "write_file":
+            return await self.ws.write_file(args.get("path", ""), args.get("content", ""))
+        if name == "edit_file":
+            return await self.ws.edit_file(args.get("path", ""), args.get("old", ""), args.get("new", ""),
+                                           bool(args.get("replace_all")))
+        if name == "bash":
+            return await self.ws.bash(args.get("command", ""), int(args.get("timeout") or 60))
+        if name == "aws_action":
+            from tools.aws_action import check
+            problem = check(args.get("service", ""), args.get("operation", ""))
+            if problem:
+                return {"ok": False, "error": problem}
+            return {"ok": True, "status": "waiting for the user's approval",
+                    "summary": describe_action(name, args, self.ws.repo)}
+        if name in APPROVAL_ACTIONS and self._auto_ok(name, args):
+            from pipeline.code_tasks import run_code_action
+            return await run_code_action(self.ws, self.pr_token, name,
+                                         {**args, "branch": self.branch} if name == "push_branch" else args)
+        if name in APPROVAL_ACTIONS:
+            if not self.pr_token:
+                return {"ok": False, "error": f"connect {self.ws.provider} in Connectors first"}
+            return {"ok": True, "status": "waiting for the user's approval",
+                    "summary": describe_action(name, args, self.ws.repo)}
+        if name in _HOST_TOOLS and name != "open_pr":
+            return await self._host_read(name, args)
+        if name == "open_pr":
+            if not self.pr_token:
+                return {"ok": False, "error": f"connect {self.ws.provider} in Connectors to open PRs"}
+            from pipeline.code_tasks import open_pr
+            return await open_pr(self.ws, self.pr_token, args.get("title", ""), args.get("body", ""), self.branch)
+        if name == "aws":
+            return await self.aws.call(args.get("service", ""), args.get("operation", ""),
+                                       args.get("params") or {}, args.get("region", ""))
+        return {"ok": False, "error": f"unknown tool {name}"}
+
+    def _auto_ok(self, name: str, args: dict) -> bool:
+        """Autopilot mode runs low-risk repo steps itself: re-running CI, and pushing to this chat's own branch."""
+        if self.mode != "autopilot" or not self.pr_token:
+            return False
+        if name == "rerun_ci":
+            return True
+        return name == "push_branch" and bool(self.branch) and args.get("branch", "") in ("", self.branch)
+
+    async def _host_read(self, name: str, args: dict) -> dict:
+        if not self.pr_token:
+            return {"ok": False, "error": f"connect {self.ws.provider} in Connectors first"}
+        from tools.git_host import GitHost, GitHostError
+        host = GitHost(self.ws.provider, self.ws.repo, self.pr_token)
+        try:
+            if name == "list_prs":
+                return {"ok": True, "prs": await host.list_prs(args.get("state") or "open")}
+            if name == "pr_status":
+                return {"ok": True, **await host.pr_status(int(args.get("number")))}
+            if name == "list_workflows":
+                return {"ok": True, "workflows": await host.list_workflows()}
+            if name == "list_ci_runs":
+                return {"ok": True, "runs": await host.list_runs(args.get("limit") or 10)}
+            if name == "ci_logs":
+                return {"ok": True, **await host.run_logs(int(args.get("run_id")))}
+            if name == "list_secrets":
+                return {"ok": True, "names": await host.list_secrets()}
+        except (GitHostError, ValueError, TypeError) as e:
+            return {"ok": False, "error": str(e)[:400]}
+        return {"ok": False, "error": f"unknown tool {name}"}
+
+    def extra_events(self, call_id: str, name: str, args: dict, result: dict) -> list[dict]:
+        if name in APPROVAL_ACTIONS and result.get("status") == "waiting for the user's approval":
+            target = self._target(args)
+            args = {k: v for k, v in args.items() if k != "repo"}
+            if name == "push_branch" and not args.get("branch") and self.branch:
+                args = {**args, "branch": self.branch}
+            # The real args stay server-side, with the repo they're for.
+            self.pending[call_id] = {"name": name, "args": args, "provider": target.provider, "repo": target.repo}
+            shown = {**args, "value": "••••••"} if name == "set_secret" else args
+            return [{"type": "approval", "id": call_id, "name": name, "args": shown, "summary": result["summary"]}]
+        return []
