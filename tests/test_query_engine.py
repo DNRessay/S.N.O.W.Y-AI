@@ -1,0 +1,592 @@
+import json
+
+import pytest
+import respx
+from httpx import Response
+
+from pipeline.query_engine import (
+    QueryEngine,
+    RateLimitError,
+    _cohere_fallback,
+    _parse_retry_seconds,
+    _retry_after_seconds,
+)
+
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+COHERE_URL = "https://api.cohere.com/v2/chat"
+LOCAL_BASE = "https://bonsai.example.modal.run"
+LOCAL_URL = LOCAL_BASE + "/v1/chat/completions"
+LOCAL_HEALTH = LOCAL_BASE + "/health"
+TPD_429 = b"...on tokens per day (TPD)... Please try again in 10m55.776s."
+
+
+def _sse(*deltas):
+    lines = [
+        "data: " + json.dumps({"choices": [{"delta": {"reasoning_content": "thinking..."}}]}),
+        *("data: " + json.dumps({"choices": [{"delta": {"content": d}}]}) for d in deltas),
+        "data: [DONE]",
+    ]
+    return ("\n\n".join(lines) + "\n\n").encode()
+
+
+@pytest.fixture
+def local_llm(monkeypatch):
+    from config import settings
+    monkeypatch.setattr(settings, "LOCAL_LLM_URL", LOCAL_BASE)
+    monkeypatch.setattr(settings, "LOCAL_LLM_API_KEY", "local-key")
+    monkeypatch.setattr("pipeline.query_engine._groq_blocked_until", 0.0)
+
+    async def fake_sleep(s):
+        pass
+
+    monkeypatch.setattr("pipeline.query_engine.asyncio.sleep", fake_sleep)
+
+
+def test_retry_after_seconds_prefers_the_header():
+    resp = Response(429, headers={"retry-after": "4.5"}, content=b"try again in 99s")
+    assert _retry_after_seconds(resp, resp.content) == 4.5
+
+
+def test_retry_after_seconds_falls_back_to_parsing_the_message():
+    resp = Response(429)
+    assert _retry_after_seconds(resp, b"Rate limit reached. Please try again in 7.25s") == 7.25
+
+
+def test_retry_after_seconds_defaults_when_nothing_is_parseable():
+    resp = Response(429)
+    assert _retry_after_seconds(resp, b"no timing info here") == 5.0
+
+
+def test_retry_after_seconds_is_capped():
+    resp = Response(429, headers={"retry-after": "9999"})
+    assert _retry_after_seconds(resp) == 20.0
+
+
+def test_parse_retry_seconds_handles_the_minutes_and_seconds_format():
+    """A live TPD (tokens-per-day) failure named its wait as "10m55.776s" —
+    the old seconds-only pattern still matched (regexes don't require
+    matching from the start of the string), silently capturing just the
+    "55.776" tail and treating an ~11 minute wait as ~1 minute."""
+    resp = Response(429)
+    body = b'{"error":{"message":"...on tokens per day (TPD): Limit 200000, Used 197484, Requested 4034. Please try again in 10m55.776s."}}'
+    assert _parse_retry_seconds(resp, body) == pytest.approx(655.776)
+
+
+def test_parse_retry_seconds_plain_seconds_format_still_works():
+    resp = Response(429)
+    assert _parse_retry_seconds(resp, b"Please try again in 13.86s") == pytest.approx(13.86)
+
+
+def test_parse_retry_seconds_returns_none_when_nothing_is_parseable():
+    resp = Response(429)
+    assert _parse_retry_seconds(resp, b"no timing info here") is None
+
+
+def test_retry_after_seconds_caps_a_minutes_scale_wait():
+    resp = Response(429)
+    body = b"Please try again in 10m55.776s."
+    assert _retry_after_seconds(resp, body) == 20.0
+
+
+def _groq_response(content: str):
+    return Response(200, json={
+        "choices": [{"message": {"content": content}, "finish_reason": "stop"}]
+    })
+
+
+@pytest.mark.asyncio
+async def test_call_llm_returns_content_and_hits_groq_on_first_call(moto_cache_table):
+    engine = QueryEngine()
+    with respx.mock:
+        route = respx.post(GROQ_URL).mock(return_value=_groq_response("hello there"))
+        result = await engine.call_llm([{"role": "user", "content": "hi"}], session_id="s1")
+
+    assert result["content"] == "hello there"
+    assert result["cached"] is False
+    assert route.called
+
+
+@pytest.mark.asyncio
+async def test_call_llm_serves_second_identical_call_from_cache(moto_cache_table):
+    engine = QueryEngine()
+    messages = [{"role": "user", "content": "hi"}]
+    with respx.mock:
+        route = respx.post(GROQ_URL).mock(return_value=_groq_response("first"))
+        first = await engine.call_llm(messages, session_id="s1")
+        second = await engine.call_llm(messages, session_id="s1")
+
+    assert first["cached"] is False
+    assert second["cached"] is True
+    assert second["content"] == "first"
+    assert route.call_count == 1  # second call served from DynamoDB cache, not Groq
+
+
+@pytest.mark.asyncio
+async def test_call_llm_does_not_reuse_cache_for_a_different_followup_query(moto_cache_table):
+    # Regression test: the cache key used to be hashed from messages[:2]
+    # (system + the *first* history entry), which is identical for every
+    # turn after the first one in a session — so a second, unrelated
+    # question was silently served the first turn's cached reply instead
+    # of ever reaching Groq. Same system prompt and same first history
+    # entry here, but a genuinely different final user query, must produce
+    # two different Groq calls and two different answers.
+    engine = QueryEngine()
+    system = {"role": "system", "content": "ctx"}
+    first_turn_user = {"role": "user", "content": "hello world"}
+    first_turn_assistant = {"role": "assistant", "content": "hi there"}
+    with respx.mock:
+        route = respx.post(GROQ_URL).mock(side_effect=[
+            _groq_response("hi there"),
+            _groq_response("the sky is blue because of Rayleigh scattering"),
+        ])
+        first = await engine.call_llm([system, first_turn_user], session_id="s1")
+        second = await engine.call_llm(
+            [system, first_turn_user, first_turn_assistant, {"role": "user", "content": "why is the sky blue"}],
+            session_id="s1",
+        )
+
+    assert first["content"] == "hi there"
+    assert second["content"] == "the sky is blue because of Rayleigh scattering"
+    assert second["cached"] is False
+    assert route.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_call_llm_raises_clear_error_when_groq_returns_no_choices(moto_cache_table):
+    # e.g. an auth failure, unknown model, or rate limit — Groq's error shape
+    # has no "choices" key, and the failure reason must survive into the
+    # exception message rather than surfacing as a bare KeyError.
+    engine = QueryEngine()
+    with respx.mock:
+        respx.post(GROQ_URL).mock(
+            return_value=Response(401, json={"error": {"message": "Invalid API Key"}})
+        )
+        with pytest.raises(RuntimeError, match="Invalid API Key"):
+            await engine.call_llm([{"role": "user", "content": "hi"}], session_id="s1")
+
+
+@pytest.mark.asyncio
+async def test_call_llm_retries_once_after_a_429_and_returns_the_retry_s_content(moto_cache_table, monkeypatch):
+    """Groq's ITPM quota is a rolling per-account window, not a per-request
+    cap — a 429 mid-burst usually clears itself within the wait Groq names
+    ("Please try again in 13.86s"). One retry after that wait turns it into
+    a normal reply instead of a raw error shown to the user."""
+    engine = QueryEngine()
+    sleeps = []
+
+    async def fake_sleep(s):
+        sleeps.append(s)
+
+    monkeypatch.setattr("pipeline.query_engine.asyncio.sleep", fake_sleep)
+
+    with respx.mock:
+        route = respx.post(GROQ_URL).mock(side_effect=[
+            Response(429, json={"error": {"message": "Rate limit reached... Please try again in 2.5s"}}),
+            _groq_response("worked on retry"),
+        ])
+        result = await engine.call_llm([{"role": "user", "content": "hi"}], session_id="s1")
+
+    assert result["content"] == "worked on retry"
+    assert route.call_count == 2
+    assert sleeps == [2.5]
+
+
+@pytest.mark.asyncio
+async def test_call_llm_raises_if_the_retry_also_429s(moto_cache_table, monkeypatch):
+    engine = QueryEngine()
+
+    async def fake_sleep(s):
+        pass
+
+    monkeypatch.setattr("pipeline.query_engine.asyncio.sleep", fake_sleep)
+
+    with respx.mock:
+        respx.post(GROQ_URL).mock(
+            return_value=Response(429, json={"error": {"message": "Please try again in 1s"}})
+        )
+        with pytest.raises(RuntimeError, match="429"):
+            await engine.call_llm([{"role": "user", "content": "hi"}], session_id="s1")
+
+
+def _groq_sse_response(pieces: list[str], finish_reason: str = "stop"):
+    body = "".join(
+        f'data: {json.dumps({"choices": [{"delta": {"content": p}}]})}\n\n'
+        for p in pieces
+    )
+    # Real Groq/OpenAI-shaped streams send finish_reason on its own trailing
+    # chunk with no content, after the last piece of text.
+    body += f'data: {json.dumps({"choices": [{"delta": {}, "finish_reason": finish_reason}]})}\n\n'
+    body += "data: [DONE]\n\n"
+    return Response(200, headers={"content-type": "text/event-stream"}, content=body)
+
+
+@pytest.mark.asyncio
+async def test_stream_llm_yields_each_piece_as_groq_sends_it(moto_cache_table):
+    engine = QueryEngine()
+    with respx.mock:
+        route = respx.post(GROQ_URL).mock(return_value=_groq_sse_response(["hel", "lo ", "there"]))
+        pieces = [p async for p in engine.stream_llm([{"role": "user", "content": "hi"}], session_id="s1")]
+
+    assert pieces == ["hel", "lo ", "there"]
+    assert route.called
+
+
+@pytest.mark.asyncio
+async def test_stream_llm_serves_second_identical_call_from_cache_in_one_piece(moto_cache_table):
+    engine = QueryEngine()
+    messages = [{"role": "user", "content": "hi"}]
+    with respx.mock:
+        route = respx.post(GROQ_URL).mock(return_value=_groq_sse_response(["first"]))
+        first = [p async for p in engine.stream_llm(messages, session_id="s1")]
+        second = [p async for p in engine.stream_llm(messages, session_id="s1")]
+
+    assert "".join(first) == "first"
+    assert second == ["first"]  # served whole from DynamoDB cache, not re-streamed
+    assert route.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_stream_llm_does_not_reuse_cache_for_a_different_followup_query(moto_cache_table):
+    engine = QueryEngine()
+    system = {"role": "system", "content": "ctx"}
+    first_turn_user = {"role": "user", "content": "hello world"}
+    first_turn_assistant = {"role": "assistant", "content": "hi there"}
+    with respx.mock:
+        route = respx.post(GROQ_URL).mock(side_effect=[
+            _groq_sse_response(["hi there"]),
+            _groq_sse_response(["the sky is blue"]),
+        ])
+        first = [p async for p in engine.stream_llm([system, first_turn_user], session_id="s1")]
+        second = [p async for p in engine.stream_llm(
+            [system, first_turn_user, first_turn_assistant, {"role": "user", "content": "why is the sky blue"}],
+            session_id="s1",
+        )]
+
+    assert "".join(first) == "hi there"
+    assert "".join(second) == "the sky is blue"
+    assert route.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_stream_llm_appends_a_visible_note_when_cut_off_by_max_tokens(moto_cache_table):
+    """finish_reason "length" means Groq stopped because the reply hit
+    max_tokens, not because the model was done — a silent cutoff mid-
+    sentence reads as broken, so this must say so instead."""
+    engine = QueryEngine()
+    with respx.mock:
+        respx.post(GROQ_URL).mock(
+            return_value=_groq_sse_response(["this got cut", " off mid-sen"], finish_reason="length")
+        )
+        pieces = [p async for p in engine.stream_llm([{"role": "user", "content": "hi"}], session_id="s1")]
+
+    full = "".join(pieces)
+    assert full.startswith("this got cut off mid-sen")
+    assert "cut off" in full.lower()
+    assert "reply length limit" in full
+
+
+@pytest.mark.asyncio
+async def test_stream_llm_adds_no_note_when_finish_reason_is_stop(moto_cache_table):
+    engine = QueryEngine()
+    with respx.mock:
+        respx.post(GROQ_URL).mock(return_value=_groq_sse_response(["a complete reply"], finish_reason="stop"))
+        pieces = [p async for p in engine.stream_llm([{"role": "user", "content": "hi"}], session_id="s1")]
+
+    assert "".join(pieces) == "a complete reply"
+
+
+@pytest.mark.asyncio
+async def test_stream_llm_raises_clear_error_when_groq_returns_no_choices(moto_cache_table):
+    engine = QueryEngine()
+    with respx.mock:
+        respx.post(GROQ_URL).mock(
+            return_value=Response(401, json={"error": {"message": "Invalid API Key"}})
+        )
+        with pytest.raises(RuntimeError, match="Invalid API Key"):
+            async for _ in engine.stream_llm([{"role": "user", "content": "hi"}], session_id="s1"):
+                pass
+
+
+@pytest.mark.asyncio
+async def test_stream_llm_retries_once_after_a_429_and_streams_the_retry(moto_cache_table, monkeypatch):
+    engine = QueryEngine()
+    sleeps = []
+
+    async def fake_sleep(s):
+        sleeps.append(s)
+
+    monkeypatch.setattr("pipeline.query_engine.asyncio.sleep", fake_sleep)
+
+    with respx.mock:
+        route = respx.post(GROQ_URL).mock(side_effect=[
+            Response(429, content=b"Please try again in 3.1s"),
+            _groq_sse_response(["worked on retry"]),
+        ])
+        pieces = [p async for p in engine.stream_llm([{"role": "user", "content": "hi"}], session_id="s1")]
+
+    assert "".join(pieces) == "worked on retry"
+    assert route.call_count == 2
+    assert sleeps == [3.1]
+
+
+@pytest.mark.asyncio
+async def test_stream_llm_raises_if_the_retry_also_429s(moto_cache_table, monkeypatch):
+    engine = QueryEngine()
+
+    async def fake_sleep(s):
+        pass
+
+    monkeypatch.setattr("pipeline.query_engine.asyncio.sleep", fake_sleep)
+
+    with respx.mock:
+        respx.post(GROQ_URL).mock(return_value=Response(429, content=b"Please try again in 1s"))
+        with pytest.raises(RuntimeError, match="429"):
+            async for _ in engine.stream_llm([{"role": "user", "content": "hi"}], session_id="s1"):
+                pass
+
+
+@pytest.mark.asyncio
+async def test_cohere_fallback_returns_none_when_no_key_configured(monkeypatch):
+    from config import settings
+    monkeypatch.setattr(settings, "COHERE_API_KEY", "")
+    result = await _cohere_fallback([{"role": "user", "content": "hi"}], 800)
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_cohere_fallback_returns_the_reply_text(monkeypatch):
+    from config import settings
+    monkeypatch.setattr(settings, "COHERE_API_KEY", "test-key")
+    with respx.mock:
+        respx.post(COHERE_URL).mock(return_value=Response(200, json={
+            "message": {"role": "assistant", "content": [{"type": "text", "text": "hello from cohere"}]},
+        }))
+        result = await _cohere_fallback([{"role": "user", "content": "hi"}], 800)
+    assert result == "hello from cohere"
+
+
+@pytest.mark.asyncio
+async def test_cohere_fallback_returns_none_on_non_200(monkeypatch):
+    from config import settings
+    monkeypatch.setattr(settings, "COHERE_API_KEY", "test-key")
+    with respx.mock:
+        respx.post(COHERE_URL).mock(return_value=Response(401, json={"message": "invalid key"}))
+        result = await _cohere_fallback([{"role": "user", "content": "hi"}], 800)
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_cohere_fallback_returns_none_on_network_failure(monkeypatch):
+    import httpx as httpx_mod
+
+    from config import settings
+    monkeypatch.setattr(settings, "COHERE_API_KEY", "test-key")
+    with respx.mock:
+        respx.post(COHERE_URL).mock(side_effect=httpx_mod.ConnectError("down"))
+        result = await _cohere_fallback([{"role": "user", "content": "hi"}], 800)
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_cohere_fallback_returns_none_on_empty_content(monkeypatch):
+    from config import settings
+    monkeypatch.setattr(settings, "COHERE_API_KEY", "test-key")
+    with respx.mock:
+        respx.post(COHERE_URL).mock(return_value=Response(200, json={"message": {"content": []}}))
+        result = await _cohere_fallback([{"role": "user", "content": "hi"}], 800)
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_stream_llm_falls_back_to_cohere_on_a_daily_quota_wait(moto_cache_table, monkeypatch):
+    """The exact live scenario this was built for: Groq's TPD wait is too
+    long to sleep through, but with a Cohere key configured, the turn
+    still gets a real answer instead of "try again in ~11 minutes."""
+    from config import settings
+    monkeypatch.setattr(settings, "COHERE_API_KEY", "test-key")
+    engine = QueryEngine()
+    sleeps = []
+
+    async def fake_sleep(s):
+        sleeps.append(s)
+
+    monkeypatch.setattr("pipeline.query_engine.asyncio.sleep", fake_sleep)
+
+    with respx.mock:
+        respx.post(GROQ_URL).mock(
+            return_value=Response(429, content=b"...on tokens per day (TPD)... Please try again in 10m55.776s.")
+        )
+        respx.post(COHERE_URL).mock(return_value=Response(200, json={
+            "message": {"content": [{"type": "text", "text": "the cohere answer"}]},
+        }))
+        pieces = [p async for p in engine.stream_llm([{"role": "user", "content": "hi"}], session_id="s1")]
+
+    assert sleeps == []  # never slept — the wait was too long to bother
+    full = "".join(pieces)
+    assert "the cohere answer" in full
+    assert "Cohere fallback" in full
+
+
+@pytest.mark.asyncio
+async def test_stream_llm_still_raises_when_cohere_fallback_also_fails(moto_cache_table, monkeypatch):
+    from config import settings
+    monkeypatch.setattr(settings, "COHERE_API_KEY", "test-key")
+    engine = QueryEngine()
+
+    async def fake_sleep(s):
+        pass
+
+    monkeypatch.setattr("pipeline.query_engine.asyncio.sleep", fake_sleep)
+
+    with respx.mock:
+        respx.post(GROQ_URL).mock(
+            return_value=Response(429, content=b"...on tokens per day (TPD)... Please try again in 10m55.776s.")
+        )
+        respx.post(COHERE_URL).mock(return_value=Response(500, text="cohere is down too"))
+        with pytest.raises(RateLimitError) as exc_info:
+            async for _ in engine.stream_llm([{"role": "user", "content": "hi"}], session_id="s1"):
+                pass
+
+    assert exc_info.value.retry_after == pytest.approx(655.776)
+
+
+@pytest.mark.asyncio
+async def test_stream_llm_fails_fast_without_retrying_on_a_daily_quota_wait(moto_cache_table, monkeypatch):
+    """A TPD (tokens-per-day) 429 names a wait of minutes, not seconds — a
+    real one hit this exact case: "try again in 10m55.776s". Retrying
+    after a short capped sleep is pointless (it's still going to be
+    exceeded), so this should fail fast, as a RateLimitError carrying the
+    real (uncapped) wait, instead of burning a second call and 20s first."""
+    engine = QueryEngine()
+    sleeps = []
+
+    async def fake_sleep(s):
+        sleeps.append(s)
+
+    monkeypatch.setattr("pipeline.query_engine.asyncio.sleep", fake_sleep)
+
+    with respx.mock:
+        route = respx.post(GROQ_URL).mock(
+            return_value=Response(429, content=b"...on tokens per day (TPD)... Please try again in 10m55.776s.")
+        )
+        with pytest.raises(RateLimitError) as exc_info:
+            async for _ in engine.stream_llm([{"role": "user", "content": "hi"}], session_id="s1"):
+                pass
+
+    assert route.call_count == 1  # no wasted retry
+    assert sleeps == []
+    assert exc_info.value.retry_after == pytest.approx(655.776)
+
+
+def test_fire_break_invalidates_known_vector_only(moto_cache_table):
+    engine = QueryEngine()
+    engine.cache_ctrl.write("k", "v")
+    engine.fire_break("not_a_vector")
+    assert engine.cache_ctrl.read("k") == "v"
+    engine.fire_break("model_switch")
+    assert engine.cache_ctrl.check_break() is True
+
+
+@pytest.mark.asyncio
+async def test_stream_llm_uses_the_local_model_before_cohere(moto_cache_table, local_llm, monkeypatch):
+    from config import settings
+    monkeypatch.setattr(settings, "COHERE_API_KEY", "test-key")
+    engine = QueryEngine()
+
+    with respx.mock:
+        respx.post(GROQ_URL).mock(return_value=Response(429, content=TPD_429))
+        respx.get(LOCAL_HEALTH).mock(return_value=Response(200, json={"status": "ok"}))
+        local = respx.post(LOCAL_URL).mock(return_value=Response(200, content=_sse("hello ", "from bonsai")))
+        cohere = respx.post(COHERE_URL).mock(return_value=Response(200, json={}))
+        pieces = [p async for p in engine.stream_llm([{"role": "user", "content": "hi"}], session_id="s1")]
+
+    full = "".join(pieces)
+    assert "hello from bonsai" in full
+    assert "self-hosted backup model" in full
+    assert "thinking..." not in full
+    assert cohere.call_count == 0
+    sent = json.loads(local.calls[0].request.content)
+    assert sent["max_tokens"] == settings.LOCAL_LLM_MAX_TOKENS
+    assert local.calls[0].request.headers["authorization"] == "Bearer local-key"
+
+
+@pytest.mark.asyncio
+async def test_stream_llm_skips_groq_while_its_quota_wait_is_still_running(moto_cache_table, local_llm):
+    engine = QueryEngine()
+
+    with respx.mock:
+        groq = respx.post(GROQ_URL).mock(return_value=Response(429, content=TPD_429))
+        respx.get(LOCAL_HEALTH).mock(return_value=Response(200, json={"status": "ok"}))
+        respx.post(LOCAL_URL).mock(return_value=Response(200, content=_sse("one")))
+        [p async for p in engine.stream_llm([{"role": "user", "content": "first"}], session_id="s1")]
+        respx.post(LOCAL_URL).mock(return_value=Response(200, content=_sse("two")))
+        second = "".join([p async for p in engine.stream_llm([{"role": "user", "content": "second"}], session_id="s1")])
+
+    assert groq.call_count == 1
+    assert "two" in second
+
+
+@pytest.mark.asyncio
+async def test_stream_llm_falls_through_to_cohere_when_the_local_model_is_down(moto_cache_table, local_llm, monkeypatch):
+    from config import settings
+    monkeypatch.setattr(settings, "COHERE_API_KEY", "test-key")
+    engine = QueryEngine()
+
+    with respx.mock:
+        respx.post(GROQ_URL).mock(return_value=Response(429, content=TPD_429))
+        respx.get(LOCAL_HEALTH).mock(return_value=Response(200, json={"status": "ok"}))
+        respx.post(LOCAL_URL).mock(return_value=Response(503, text="no capacity"))
+        respx.post(COHERE_URL).mock(return_value=Response(200, json={
+            "message": {"content": [{"type": "text", "text": "the cohere answer"}]},
+        }))
+        full = "".join([p async for p in engine.stream_llm([{"role": "user", "content": "hi"}], session_id="s1")])
+
+    assert "the cohere answer" in full
+    assert "self-hosted" not in full
+
+
+@pytest.mark.asyncio
+async def test_stream_llm_raises_when_every_backup_is_down(moto_cache_table, local_llm):
+    import httpx as httpx_mod
+    engine = QueryEngine()
+
+    with respx.mock:
+        respx.post(GROQ_URL).mock(return_value=Response(429, content=TPD_429))
+        respx.get(LOCAL_HEALTH).mock(return_value=Response(200, json={"status": "ok"}))
+        respx.post(LOCAL_URL).mock(side_effect=httpx_mod.ReadTimeout("cold start too slow"))
+        with pytest.raises(RateLimitError):
+            async for _ in engine.stream_llm([{"role": "user", "content": "hi"}], session_id="s1"):
+                pass
+
+
+@pytest.mark.asyncio
+async def test_stream_llm_fails_fast_while_blocked_and_the_backup_is_down(moto_cache_table, local_llm, monkeypatch):
+    import time
+    monkeypatch.setattr("pipeline.query_engine._groq_blocked_until", time.monotonic() + 600)
+    engine = QueryEngine()
+
+    with respx.mock:
+        groq = respx.post(GROQ_URL).mock(return_value=Response(429, content=TPD_429))
+        respx.get(LOCAL_HEALTH).mock(return_value=Response(200, json={"status": "ok"}))
+        respx.post(LOCAL_URL).mock(return_value=Response(503, text="no capacity"))
+        with pytest.raises(RateLimitError) as exc_info:
+            async for _ in engine.stream_llm([{"role": "user", "content": "hi"}], session_id="s1"):
+                pass
+
+    assert groq.call_count == 0
+    assert 590 < exc_info.value.retry_after <= 600
+
+
+@pytest.mark.asyncio
+async def test_stream_llm_waits_out_the_local_model_still_loading(moto_cache_table, local_llm):
+    loading = Response(503, json={"error": {"message": "Loading model", "code": 503}})
+    engine = QueryEngine()
+
+    with respx.mock:
+        respx.post(GROQ_URL).mock(return_value=Response(429, content=TPD_429))
+        health = respx.get(LOCAL_HEALTH).mock(side_effect=[loading, loading, Response(200, json={"status": "ok"})])
+        respx.post(LOCAL_URL).mock(return_value=Response(200, content=_sse("warmed up")))
+        full = "".join([p async for p in engine.stream_llm([{"role": "user", "content": "hi"}], session_id="s1")])
+
+    assert health.call_count == 3
+    assert "warmed up" in full

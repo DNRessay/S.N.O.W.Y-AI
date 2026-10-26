@@ -1,0 +1,82 @@
+name: Deploy frontend to Cloudflare Pages
+
+on:
+  push:
+    branches: ["claude/bold-hawking-8o28g3"]
+    paths: ["frontend/**", ".github/workflows/cloudflare-pages.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Build & Deploy (Cloudflare Pages)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm install
+
+      - name: Build
+        working-directory: frontend
+        env:
+          VITE_API_URL: ${{ secrets.SNOWY_API_URL }}
+        run: npm run build
+
+      - name: Verify baked API URL
+        # Vite inlines VITE_API_URL as a literal string at build time — this
+        # confirms what's actually in the shipped bundle rather than trusting
+        # the secret is set/correct. Not sensitive: the Lambda Function URL
+        # is already a public, unauthenticated-by-network endpoint.
+        working-directory: frontend
+        run: |
+          found=$(grep -o 'https://[a-zA-Z0-9.-]*\.on\.aws' dist/assets/*.js || true)
+          if [ -z "$found" ]; then
+            echo "::error::No lambda-url.*.on.aws string found in the built bundle — VITE_API_URL secret is likely empty or unset, so API calls will hit a relative/wrong URL"
+            grep -o 'fetch(\`\${[a-zA-Z0-9_$]*}/auth/login\`)' dist/assets/*.js || true
+            exit 1
+          fi
+          echo "Baked API URL: $found"
+
+      - name: Deploy to Cloudflare Pages
+        # wrangler's CLI output always prints a fresh, permanent
+        # per-deployment URL (a commit hash prefix) regardless of whether
+        # the deploy was classified production or preview — that's not a
+        # bug, and it's not the URL to share/bookmark. The stable one is
+        # always https://snowy.pages.dev (confirmed: it serves this
+        # exact build's asset filenames every time), independent of what
+        # this step prints below.
+        working-directory: frontend
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: npx wrangler@3 pages deploy dist --project-name=snowy --branch=main
+
+      - name: Verify the stable production URL served this build
+        # Cloudflare's edge can take a few seconds to pick up a deploy after
+        # wrangler reports success, so a check run immediately after can see
+        # the previous build for a moment — retry for up to ~30s before
+        # failing for real.
+        working-directory: frontend
+        run: |
+          expected=$(basename dist/assets/index-*.js)
+          for i in 1 2 3 4 5 6; do
+            status=$(curl -s -o /tmp/prod_body.html -w "%{http_code}" https://snowy.pages.dev/)
+            if [ "$status" = "200" ] && grep -q "$expected" /tmp/prod_body.html; then
+              echo "Confirmed: https://snowy.pages.dev is serving $expected"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::https://snowy.pages.dev (status $status) is not serving this build's $expected after retrying"
+          exit 1

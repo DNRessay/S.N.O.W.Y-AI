@@ -1,0 +1,644 @@
+import base64
+import json
+
+from fastapi import APIRouter, Depends, HTTPException, Request
+
+from agents.research_agent import ResearchAgent
+from config import settings
+from gateway import ratelimit
+from gateway.auth import issue_token, require_account, secret_matches, verify_passphrase
+from pipeline import llm_providers
+from pipeline.agent_intent import (
+    detect_explore_intent,
+    detect_plan_intent,
+    explore_status_label,
+    format_matches,
+    format_plan,
+    plan_status_label,
+    run_explore_intent,
+    run_plan_intent,
+)
+from pipeline.bash_intent import (
+    bash_status_label,
+    detect_bash_intent,
+    format_bash_result,
+    run_bash_intent,
+)
+from pipeline.bootstrap import Bootstrap
+from pipeline.companion_intent import (
+    companion_status_label,
+    detect_companion_intent,
+    format_companion_result,
+    run_companion_intent,
+)
+from pipeline.orchestrator_intent import (
+    orchestrator_status_label,
+    detect_orchestrator_intent,
+    format_orchestrator_result,
+    run_orchestrator_intent,
+)
+from pipeline.google_intent import detect_google_intent, format_google_result, run_google_intent
+from pipeline.guide_intent import (
+    detect_guide_intent,
+    format_guide_result,
+    guide_status_label,
+    run_guide_intent,
+)
+from pipeline.memory_search_intent import (
+    detect_memory_search_intent,
+    format_memory_search_result,
+    memory_search_status_label,
+    run_memory_search_intent,
+)
+from pipeline.plan_continue import (
+    continue_status_label,
+    detect_continue_intent,
+    format_continue_result,
+    run_continue_intent,
+)
+from pipeline.repo_context import (
+    detect_repo_intent,
+    fetch_repo_file_raw,
+    repo_status_label,
+    run_repo_intent,
+)
+from pipeline.runs import durable
+from pipeline.session_title import generate_title
+from pipeline.deepplan_intent import (
+    detect_deepplan_intent,
+    format_deepplan_result,
+    run_deepplan_intent,
+    deepplan_status_label,
+)
+from pipeline.voice_stream import with_speech
+from pipeline.web_context import detect_web_intent, run_web_intent, status_label
+from storage.embeddings import embed_text
+from storage.neon_store import get_store
+from tau.tau_engine import TAUEngine
+from tools import file_reader
+
+router = APIRouter()
+_tau = TAUEngine()
+
+
+def _get_trust(request: Request) -> str:
+    if secret_matches(request.headers.get("x-api-key", ""), settings.SECRET_KEY):
+        return "TRUSTED"
+    return settings.TRUST_MODE
+
+
+# Wrong passphrases allowed before login locks: per caller, and for everyone at once (a spread-out guess).
+LOGIN_FAILS_PER_IP, LOGIN_FAILS_TOTAL, LOGIN_WINDOW_SECONDS = 5, 30, 15 * 60
+
+
+@router.post("/auth/login")
+async def login(request: Request):
+    body = await request.json()
+    passphrase = body.get("passphrase", "")
+    if not passphrase:
+        raise HTTPException(400, "passphrase required")
+    ip = ratelimit.client_ip(request)
+    if ratelimit.blocked("login", ip, LOGIN_FAILS_PER_IP) or ratelimit.blocked("login", "*", LOGIN_FAILS_TOTAL):
+        raise HTTPException(429, "Too many wrong passphrases — wait 15 minutes, or reset it by email")
+
+    db = await get_store()
+    account = await db.get_account("owner")
+    if not account or not verify_passphrase(passphrase, account["passphrase_hash"]):
+        ratelimit.record("login", ip, LOGIN_WINDOW_SECONDS)
+        ratelimit.record("login", "*", LOGIN_WINDOW_SECONDS)
+        raise HTTPException(401, "Incorrect passphrase")
+
+    ratelimit.clear("login", ip)
+    return {"token": issue_token(account["id"], account["role"], version=account.get("token_version") or 0)}
+
+
+def _is_image(attachment: dict) -> bool:
+    return file_reader.is_image(attachment.get("name", ""), attachment.get("mime") or "")
+
+
+def _vision_ready(images: list) -> tuple[list, list]:
+    """Any image format → one the vision model reads (HEIC/BMP/TIFF… become JPEG); unreadable ones are
+    returned separately so the reply can say so."""
+    ok, bad = [], []
+    for a in images:
+        try:
+            converted = file_reader.to_vision_image(base64.b64decode(a.get("base64", "")), a.get("mime", ""))
+        except ValueError:
+            converted = None
+        if converted:
+            raw, mime = converted
+            ok.append({**a, "mime": mime, "base64": a["base64"] if mime == a.get("mime") else base64.b64encode(raw).decode()})
+        else:
+            bad.append({"name": a.get("name", "image"), "content": f"[{a.get('name', 'image')}: couldn't open this image format]"})
+    return ok, bad
+
+
+async def _attachment_text(a: dict, session_id: str) -> str:
+    """Text attachments carry their text in `content`; everything else (documents, audio, video) is base64
+    and gets read server-side by tools/file_reader.py. A file that can't be read says so in the message,
+    so the model can tell the user, and logs a "blocked" agent event."""
+    if a.get("content") is not None:
+        return a["content"]
+    name, b64 = a.get("name", "file"), a.get("base64", "")
+    if not b64:
+        return ""
+    from storage.neon_store import get_store
+    try:
+        text, how = await file_reader.read_file(name, a.get("mime", ""), base64.b64decode(b64))
+    except Exception as exc:
+        text, how = "", f"couldn't read it: {str(exc)[:150]}"
+    db = await get_store()
+    await db.save_agent_event(session_id, "file", f"{'ok' if text else 'blocked'}:{name} — {how}")
+    return text or f"[{name}: {how}]"
+
+
+async def _fold_attachments(user_msg: str, attachments: list, session_id: str) -> str:
+    """Appends uploaded/fetched file content to the query as fenced blocks the
+    model can read like any other context — there's no separate multimodal
+    text channel on the Groq models this app runs on, so text (including
+    text extracted server-side from PDF/Word attachments) is folded straight
+    into the message rather than sent out-of-band. Image attachments are
+    handled separately by Bootstrap, not folded here — see gateway/router.py
+    `chat()`."""
+    if not attachments:
+        return user_msg
+    blocks = ["<attachments>"]
+    for a in attachments:
+        name = a.get("name", "file")
+        content = await _attachment_text(a, session_id)
+        blocks.append(f'<file name="{name}">\n{content}\n</file>')
+    blocks.append("</attachments>")
+    return f"{user_msg}\n\n" + "\n".join(blocks)
+
+
+@router.post("/chat")
+async def chat(request: Request, trust: str = Depends(_get_trust), _account: dict = Depends(require_account)):
+    body = await request.json()
+    if body.get("voice_mode") and (body.get("model") or "auto") == "auto":
+        body["model"] = "fast"  # voice: the model that starts answering soonest (llm_providers.FAST_ORDER)
+    raw_msg = body.get("message", "")
+    session_id = body.get("session_id", "default")
+    history = body.get("history", [])
+    attachments = body.get("attachments", [])
+    web_search_enabled = body.get("web_search_enabled", True)
+    research_mode = bool(body.get("research"))
+
+    if not raw_msg and not attachments:
+        raise HTTPException(400, "message required")
+    # Attaching a file with no typed comment ("here's a PDF, look at it") is
+    # reasonable and common — only reject a genuinely empty request. A
+    # placeholder here (rather than leaving raw_msg "") keeps every
+    # downstream consumer (intent detection, chat history display, title
+    # generation) working the same as any other message, with no
+    # empty-string special-casing needed elsewhere.
+    if not raw_msg:
+        raw_msg = "Please review the attached file(s)."
+
+    images, unreadable = _vision_ready([a for a in attachments if _is_image(a)])
+    text_attachments = [a for a in attachments if not _is_image(a)] + unreadable
+
+    # augmented is what the model sees (attachments + fetched/searched
+    # content folded in); raw_msg is what's persisted as "what the user
+    # said" and embedded into long-term memory — these used to be the same
+    # string, so a search result dump ended up saved and later displayed as
+    # if the user had typed it themselves.
+    augmented = await _fold_attachments(raw_msg, text_attachments, session_id)
+    tau_ctx = await _tau.observe_and_inject(session_id, augmented, history)
+    bootstrap = Bootstrap(trust_mode=trust, tau_context=tau_ctx)
+    # Deliberately raw_msg, not augmented: web-intent detection must only look
+    # at what the user actually typed. Scanning attachment content too means
+    # any URL-shaped text sitting in an attached file — a regex literal in a
+    # workflow script, an example in a README, anything — gets treated as
+    # "fetch this," hijacking the user's real question and hanging on a
+    # garbage host until the fetch tool's own timeout. Also off entirely
+    # when the user has toggled "Web search" off in the attach menu.
+    web_intent = detect_web_intent(raw_msg) if web_search_enabled else None
+    # Checked first/preferred over web_intent when both could match ("search
+    # the repo for X" contains "search", which alone would trigger a web
+    # search) — repo phrasing is the more specific signal, and only ever
+    # does anything when this session actually has an active cloned repo.
+    repo_intent = detect_repo_intent(raw_msg)
+    # "deep plan for X" / "deepplan X" — routes to DeepPlanAgent (Groq's
+    # larger GPT-OSS-120B model) instead of PlanAgent's quick pass. Checked
+    # before plan_intent: its own trigger phrase ("deep plan for X") would
+    # otherwise also match plan_intent's looser "plan (?:for|to)" pattern,
+    # and the more specific one should win.
+    deepplan_intent = detect_deepplan_intent(raw_msg)
+    # Step 7 (sub-agent delegation) wired to a real chat message: "make a
+    # plan for X" routes through CablesMan -> PlanAgent, "search the code
+    # for X" through CablesMan -> ExploreAgent. Checked after repo_intent
+    # (more specific, and only fires with an active attached repo) and
+    # before web_intent, on raw_msg only for the same reason web/repo intent
+    # detection is — see the comment above web_intent.
+    plan_intent = None if deepplan_intent else detect_plan_intent(raw_msg)
+    explore_intent = detect_explore_intent(raw_msg)
+    # GuideAgent (agents/guide_agent.py) and CompanionAgent (agents/companion.py) —
+    # same Step 7 sub-agent delegation pattern as plan/explore above.
+    # Guide is a pure string lookup (no LLM, no network) and companion is a
+    # small Neon-persisted state machine; neither makes a Groq call, so
+    # both are always safe to fire regardless of rate-limit state.
+    guide_intent = detect_guide_intent(raw_msg)
+    companion_intent = detect_companion_intent(raw_msg)
+    # "run these in parallel: a, b, c" — routes to OrchestratorAgent (Step 7),
+    # a real asyncio.gather fan-out over the listed subtasks. See
+    # pipeline/orchestrator_intent.py for the XML-building it does under the
+    # hood to match OrchestratorAgent's own tested interface.
+    orchestrator_intent = detect_orchestrator_intent(raw_msg)
+    # Calendar/Gmail/Drive-notes/Contacts — see pipeline/google_intent.py.
+    # One registry.execute call each, scoped to this account's own Google
+    # connector (gateway/google_oauth.py); a clear "connect Google first"
+    # error comes back if there isn't one yet, same shape as any other
+    # failure this dispatches through _bypass_with_reply below.
+    google_intent = detect_google_intent(raw_msg)
+    # "when did I ask about X" / "how many times have I mentioned X" — a
+    # real, grounded search across every session's history (not just this
+    # one) instead of letting the model guess from whatever's already in
+    # its own context. See pipeline/memory_search_intent.py's docstring
+    # for the exact wrong-answer case this fixes.
+    memory_search_intent = detect_memory_search_intent(raw_msg)
+    # "run bash: X" — Step 5's permission-gated tool execution reachable
+    # directly from chat, not just from a sub-agent. Runs inside this
+    # Lambda's own /tmp sandbox only — see pipeline/bash_intent.py's
+    # docstring for exactly what that does and doesn't reach.
+    bash_intent = detect_bash_intent(raw_msg)
+    # A bare "continue"-shaped message — advances the session's persisted
+    # plan (see pipeline/plan_continue.py) by exactly one step. Checked
+    # ahead of everything else: it's the most specific/narrowest trigger of
+    # all of them (anchored, whole-message match only), so there's no
+    # meaningful collision risk with the looser ones below.
+    continue_intent = detect_continue_intent(raw_msg)
+
+    async def _bypass_with_reply(kind: str, label: str, detail: str, reply: str, result=None):
+        """Shared tail for an intent that answers the message completely on
+        its own, with no LLM call needed to phrase around it (a generated
+        plan, a code search's results) — same shape as the repo "read"
+        bypass above, just factored out since two more intents now need it.
+        Streams the tool chip + reply, persists both turns, embeds only the
+        query (the reply's source of truth — the plan, the source file —
+        lives outside chat history and would go stale/duplicate here), and
+        generates a session title on the first turn.
+
+        `result` (optional) is whatever the intent runner returned, checked
+        for an "error"/"blocked" key so the Agent Feed can flag it — same
+        outcome convention as pipeline.tool_execution.ToolExecution._persist,
+        kept consistent so a failure looks the same everywhere it's logged."""
+        tool = {"kind": kind, "label": label, "detail": detail}
+        yield f"data: {json.dumps({'tool': tool})}\n\n"
+        for i in range(0, len(reply), 400):
+            yield f"data: {json.dumps({'chunk': reply[i:i + 400]})}\n\n"
+
+        db = await get_store()
+        outcome = "blocked" if isinstance(result, dict) and (result.get("blocked") or result.get("error")) else "ok"
+        await db.save_agent_event(session_id, kind, f"{outcome}:{label}")
+        marker = f"[[SNOWY_TOOL:{json.dumps({'kind': kind, 'label': label})}]]\n"
+        await db.save_turn(session_id, "user", raw_msg)
+        await db.save_turn(session_id, "assistant", f"{marker}{reply}")
+        query_embedding = await embed_text(raw_msg)
+        await db.save_memory(session_id, raw_msg, embedding=query_embedding)
+
+        if not history:
+            title = await generate_title(raw_msg, reply)
+            if title:
+                await db.set_session_title(session_id, title)
+                yield f"data: {json.dumps({'title': title})}\n\n"
+
+        yield "data: [DONE]\n\n"
+
+    async def _research_stream():
+        """Chat's "Deep research" toggle: ResearchAgent searches and reads
+        sources, each step shown as a status line, then streams its cited
+        answer. Persisted like any other turn."""
+        agent = ResearchAgent(provider=body.get("model") or "auto")
+        texts, error, pages = [], None, 0
+        async for event in agent.run(augmented, history):
+            if event["type"] == "tool":
+                args = event.get("args") or {}
+                if event["name"] == "fetch_url":
+                    pages += 1
+                label = {"web_search": f"Searching: {args.get('query', '')}",
+                         "fetch_url": f"Reading: {args.get('url', '')}"}.get(event["name"], "Checking past chats")
+                yield f"data: {json.dumps({'status': label[:120]})}\n\n"
+            elif event["type"] == "text":
+                texts.append(event["text"])
+            elif event["type"] == "error":
+                error = event["text"]
+        reply = texts[-1] if texts else f"Research didn't finish — {error or 'no answer came back'}"
+        tool = {"kind": "research", "label": f"Deep research · {pages} page{'' if pages == 1 else 's'} read", "detail": ""}
+        yield f"data: {json.dumps({'tool': tool})}\n\n"
+        for i in range(0, len(reply), 400):
+            yield f"data: {json.dumps({'chunk': reply[i:i + 400]})}\n\n"
+        db = await get_store()
+        marker = f"[[SNOWY_TOOL:{json.dumps({'kind': 'research', 'label': tool['label']})}]]\n"
+        await db.save_turn(session_id, "user", raw_msg)
+        await db.save_turn(session_id, "assistant", f"{marker}{reply}")
+        if not history:
+            title = await generate_title(raw_msg, reply)
+            if title:
+                await db.set_session_title(session_id, title)
+                yield f"data: {json.dumps({'title': title})}\n\n"
+        yield "data: [DONE]\n\n"
+
+    async def stream_gen():
+        msg = augmented
+        tool_marker = ""
+        if research_mode:
+            async for line in _research_stream():
+                yield line
+            return
+        if continue_intent:
+            yield f"data: {json.dumps({'status': continue_status_label()})}\n\n"
+            result = await run_continue_intent(session_id)
+            reply = format_continue_result(result)
+            label = "Continuing plan" if result.get("done") is False else "Plan status"
+            async for line in _bypass_with_reply("continue", label, json.dumps(result), reply):
+                yield line
+            return
+
+        if repo_intent and repo_intent[0] == "read":
+            # A file read bypasses the LLM entirely — see
+            # pipeline.repo_context.fetch_repo_file_raw for why: reproducing
+            # exact file content through a max_tokens-limited model both
+            # wastes its (rate-limited) output budget and reliably
+            # truncates partway through anything more than a couple
+            # thousand characters, with no reasoning involved in the task
+            # anyway. Falls through to the normal flow below only if there's
+            # no active repo or the read failed, so the model can still say
+            # something sensible rather than the request just going silent.
+            _, target = repo_intent
+            yield f"data: {json.dumps({'status': repo_status_label('read', target)})}\n\n"
+            raw = await fetch_repo_file_raw(target, session_id)
+            if raw:
+                path, content = raw
+                ext = path.rsplit(".", 1)[-1] if "." in path else ""
+                reply = f"Here's the full `{path}` from the repo:\n\n```{ext}\n{content}\n```"
+                label = f"Reading {path}"
+                tool = {"kind": "read", "label": label, "detail": f'<repo_file path="{path}">\n{content}\n</repo_file>'}
+                yield f"data: {json.dumps({'tool': tool})}\n\n"
+                for i in range(0, len(reply), 400):
+                    yield f"data: {json.dumps({'chunk': reply[i:i + 400]})}\n\n"
+
+                db = await get_store()
+                await db.save_agent_event(session_id, "read", f"ok:{label}")
+                marker = f"[[SNOWY_TOOL:{json.dumps({'kind': 'read', 'label': label})}]]\n"
+                await db.save_turn(session_id, "user", raw_msg)
+                await db.save_turn(session_id, "assistant", f"{marker}{reply}")
+                # Only the query gets embedded, not the reply — the file's
+                # real content already lives in the repo clone and would
+                # just go stale/duplicate there the next time it's asked
+                # about (same reasoning as pipeline.bootstrap.Bootstrap.run's
+                # tool-driven-reply skip).
+                query_embedding = await embed_text(raw_msg)
+                await db.save_memory(session_id, raw_msg, embedding=query_embedding)
+
+                if not history:
+                    title = await generate_title(raw_msg, reply)
+                    if title:
+                        await db.set_session_title(session_id, title)
+                        yield f"data: {json.dumps({'title': title})}\n\n"
+
+                yield "data: [DONE]\n\n"
+                return
+            else:
+                db = await get_store()
+                await db.save_agent_event(session_id, "read", f"blocked:no active repo or read failed for {target}")
+
+        if bash_intent:
+            yield f"data: {json.dumps({'status': bash_status_label()})}\n\n"
+            result = await run_bash_intent(bash_intent, session_id)
+            reply = format_bash_result(result)
+            if reply:
+                label = f"$ {bash_intent}"
+                async for line in _bypass_with_reply("bash", label, json.dumps(result), reply, result=result):
+                    yield line
+                return
+
+        if repo_intent and repo_intent[0] == "grep":
+            kind, target = repo_intent
+            yield f"data: {json.dumps({'status': repo_status_label(kind, target)})}\n\n"
+            repo_block = await run_repo_intent(target, session_id)
+            if repo_block:
+                msg = (
+                    f"{msg}\n\n"
+                    "<system_note>The repo data below was already retrieved for "
+                    "this message before you saw it. Do not say you are reading, "
+                    "searching, or pulling it — just answer directly using it "
+                    "now. If it doesn't actually answer the question, say so "
+                    "instead of guessing.</system_note>\n"
+                    f"{repo_block}"
+                )
+                tool = {"kind": kind, "label": repo_status_label(kind, target).rstrip("…"), "detail": repo_block}
+                yield f"data: {json.dumps({'tool': tool})}\n\n"
+                tool_marker = f"[[SNOWY_TOOL:{json.dumps({'kind': kind, 'label': tool['label']})}]]\n"
+                db = await get_store()
+                await db.save_agent_event(session_id, kind, f"ok:{tool['label']}")
+            else:
+                db = await get_store()
+                await db.save_agent_event(session_id, kind, f"blocked:no active repo or grep failed for {target}")
+        elif deepplan_intent:
+            yield f"data: {json.dumps({'status': deepplan_status_label()})}\n\n"
+            result = await run_deepplan_intent(deepplan_intent, session_id)
+            reply = format_deepplan_result(result)
+            if reply:
+                async for line in _bypass_with_reply("deepplan", "Deep planning", json.dumps(result), reply, result=result):
+                    yield line
+                return
+            # No plan came back — fall through to the normal Bootstrap flow
+            # below rather than leaving the request hanging with no reply.
+        elif plan_intent:
+            yield f"data: {json.dumps({'status': plan_status_label()})}\n\n"
+            plan = await run_plan_intent(plan_intent, session_id)
+            reply = format_plan(plan)
+            if reply:
+                async for line in _bypass_with_reply("plan", "Planning", json.dumps(plan), reply):
+                    yield line
+                return
+            # No plan came back (PlanAgent/QueryEngine failure) — fall
+            # through to the normal Bootstrap flow below rather than
+            # leaving the request hanging with no reply at all.
+        elif explore_intent:
+            yield f"data: {json.dumps({'status': explore_status_label(explore_intent)})}\n\n"
+            matches = await run_explore_intent(explore_intent, session_id)
+            reply = format_matches(explore_intent, matches)
+            if reply:
+                label = f'Searching code for "{explore_intent}"'
+                async for line in _bypass_with_reply("explore", label, reply, reply):
+                    yield line
+                return
+        elif guide_intent:
+            yield f"data: {json.dumps({'status': guide_status_label()})}\n\n"
+            answer = await run_guide_intent(guide_intent, session_id)
+            reply = format_guide_result(answer)
+            async for line in _bypass_with_reply("guide", "SNOWY self-knowledge", reply, reply):
+                yield line
+            return
+        elif companion_intent:
+            yield f"data: {json.dumps({'status': companion_status_label(companion_intent['action'])})}\n\n"
+            result = await run_companion_intent(companion_intent, session_id)
+            reply = format_companion_result(companion_intent["action"], result)
+            label = f"Companion: {companion_intent['action']}"
+            async for line in _bypass_with_reply("companion", label, json.dumps(result), reply, result=result):
+                yield line
+            return
+        elif orchestrator_intent:
+            yield f"data: {json.dumps({'status': orchestrator_status_label(orchestrator_intent)})}\n\n"
+            result = await run_orchestrator_intent(orchestrator_intent, session_id)
+            reply = format_orchestrator_result(orchestrator_intent, result)
+            if reply:
+                async for line in _bypass_with_reply("orchestrator", "Coordinating", json.dumps(result), reply, result=result):
+                    yield line
+                return
+            # No usable result came back — fall through to the normal
+            # Bootstrap flow below rather than leaving the request hanging.
+        elif google_intent:
+            yield f"data: {json.dumps({'status': google_intent['label'] + '…'})}\n\n"
+            result = await run_google_intent(google_intent, _account["account_id"], session_id)
+            reply = format_google_result(google_intent, result)
+            if reply:
+                async for line in _bypass_with_reply(
+                    "google", google_intent["label"], json.dumps(result, default=str), reply, result=result,
+                ):
+                    yield line
+                return
+        elif memory_search_intent:
+            yield f"data: {json.dumps({'status': memory_search_status_label(memory_search_intent['term'])})}\n\n"
+            result = await run_memory_search_intent(memory_search_intent, session_id)
+            reply = format_memory_search_result(result)
+            label = f'Searching conversation history for "{memory_search_intent["term"]}"'
+            async for line in _bypass_with_reply("memory_search", label, json.dumps(result, default=str), reply):
+                yield line
+            return
+        elif web_intent:
+            kind, target = web_intent
+            yield f"data: {json.dumps({'status': status_label(kind, target)})}\n\n"
+            web_block = await run_web_intent(kind, target, session_id=session_id)
+            if web_block:
+                # Explicit framing, not just the raw block: this search ran before the
+                # model was asked (an intent match, not the model's own tool call), and
+                # SNOWY.md tells it to prefer web search — without this note a model
+                # reads that instruction, sees data already sitting in context,
+                # and narrates a fake in-progress fetch ("let me grab that for
+                # you") instead of just answering from what's already here.
+                msg = (
+                    f"{msg}\n\n"
+                    "<system_note>The web data below was already retrieved for "
+                    "this message before you saw it. Do not say you are fetching, "
+                    "grabbing, or searching for it — just answer directly using "
+                    "it now. If it's generic/unrelated and doesn't actually answer "
+                    "the question, say the search didn't find it — never invent "
+                    "specific facts to fill the gap, even if the user insists this "
+                    "is the right result. Every specific claim (credentials, "
+                    "employer, affiliations, counts, etc) must be literally present "
+                    "in the data below, not assembled from what typically fits the "
+                    "description.</system_note>\n"
+                    f"{web_block}"
+                )
+                tool = {"kind": kind, "label": status_label(kind, target).rstrip("…"), "detail": web_block}
+                yield f"data: {json.dumps({'tool': tool})}\n\n"
+                tool_marker = f"[[SNOWY_TOOL:{json.dumps({'kind': kind, 'label': tool['label']})}]]\n"
+                db = await get_store()
+                await db.save_agent_event(session_id, kind, f"ok:{tool['label']}")
+            else:
+                db = await get_store()
+                await db.save_agent_event(session_id, kind, f"blocked:no result for {target}")
+
+        reply_parts = []
+        async for chunk in bootstrap.run(
+            msg, session_id, history, images=images,
+            display_query=raw_msg, assistant_prefix=tool_marker, provider=body.get("model") or "auto",
+            use_tools=True, spoken=bool(body.get("voice_mode")),
+        ):
+            if isinstance(chunk, dict):
+                yield f"data: {json.dumps(chunk)}\n\n"
+                if "tool" not in chunk:
+                    continue
+                db = await get_store()
+                await db.save_agent_event(session_id, chunk["tool"]["kind"], f"ok:{chunk['tool']['label']}")
+                continue
+            reply_parts.append(chunk)
+            yield f"data: {json.dumps({'chunk': chunk})}\n\n"
+
+        if not history:
+            # First turn of a new session — generate a real short title
+            # instead of leaving the sidebar/header showing the raw first
+            # message or a bare session ID. Once per session, not every
+            # turn: this account's Groq rate limit is tight enough that an
+            # extra call on every message would add up fast.
+            title = await generate_title(raw_msg, "".join(reply_parts))
+            if title:
+                db = await get_store()
+                await db.set_session_title(session_id, title)
+                yield f"data: {json.dumps({'title': title})}\n\n"
+
+        yield "data: [DONE]\n\n"
+
+    # Voice mode with the natural voice: the server speaks each sentence as it's written (pipeline/voice_stream.py).
+    lines = with_speech(stream_gen(), body.get("voice_name") or "Kore") if body.get("voice") else stream_gen()
+    return durable(lines, _account["account_id"], body, "chat")
+
+
+@router.get("/status/{session_id}")
+async def status(session_id: str, _account: dict = Depends(require_account)):
+    """Backs AgentFeed.jsx's 3s poll — the most recent CABLES MAN activity
+    for this session (a route decision from core.cables_man.CablesMan.route,
+    or a tool call from pipeline.tool_execution.ToolExecution), read back
+    from the agent_events table since a chat POST and this GET are almost
+    always different Lambda invocations with no shared memory."""
+    db = await get_store()
+    event = await db.get_latest_agent_event(session_id)
+    return {"session_id": session_id, "status": "active", "event": event}
+
+
+@router.get("/status/{session_id}/events")
+async def status_events(session_id: str, since: int = 0, _account: dict = Depends(require_account)):
+    """Every tool-use/routing event for this session since `since` (an
+    event id, not a timestamp — created_at only has second granularity),
+    oldest first. Backs AgentFeed.jsx's poll so a burst of several tool
+    calls within one turn doesn't lose all but the last one the way
+    polling /status alone would."""
+    db = await get_store()
+    events = await db.get_recent_agent_events(session_id, since_id=since, limit=30)
+    return {"session_id": session_id, "events": events}
+
+
+@router.get("/sessions")
+async def sessions(_account: dict = Depends(require_account)):
+    db = await get_store()
+    return {"sessions": await db.list_sessions()}
+
+
+@router.get("/history/{session_id}")
+async def history(session_id: str, _account: dict = Depends(require_account)):
+    db = await get_store()
+    return {
+        "session_id": session_id,
+        "title": await db.get_session_title(session_id),
+        "turns": await db.get_conversation(session_id),
+    }
+
+
+@router.delete("/sessions/{session_id}")
+async def delete_session(session_id: str, _account: dict = Depends(require_account)):
+    db = await get_store()
+    await db.delete_session(session_id)
+    return {"session_id": session_id, "deleted": True}
+
+
+@router.patch("/sessions/{session_id}")
+async def rename_session(session_id: str, request: Request, _account: dict = Depends(require_account)):
+    body = await request.json()
+    title = (body.get("title") or "").strip()
+    if not title:
+        raise HTTPException(400, "title required")
+    db = await get_store()
+    await db.set_session_title(session_id, title[:80])
+    return {"session_id": session_id, "title": title[:80]}
+
+
+@router.get("/models")
+async def models(_account: dict = Depends(require_account)):
+    return {"models": llm_providers.available()}
+
+
+@router.get("/health")
+async def health():
+    return {"status": "ok", "version": "snowy-v1"}
