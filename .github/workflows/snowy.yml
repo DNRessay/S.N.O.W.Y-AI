@@ -140,18 +140,30 @@ jobs:
           esac
           echo "SNOWY_ENABLED -> ${snowy_enabled}"
 
-          # Always passed: CloudFormation reuses the previous deployed value
-          # for omitted params, so keep model IDs in sync with template.yaml.
+          # Model IDs always passed: CloudFormation reuses the previous value
+          # for omitted params, so keep these in sync with template.yaml.
           params+=(
             "SnowyEnabled=${snowy_enabled}"
-            "GroqApiKey=$(clean "$GROQ_API_KEY")"
-            "NeonDatabaseUrl=$(clean "$NEON_DATABASE_URL")"
-            "SecretKey=$(clean "$SNOWY_SECRET_KEY")"
             "GroqModel=qwen/qwen3.8-27b"
             "GroqPlanningModel=openai/gpt-oss-120b"
             "CohereModel=command-a-03-2025"
-            "PublicApiUrl=$(clean "$PUBLIC_API_URL")"
           )
+
+          # Empty values are skipped (CloudFormation keeps the previous value
+          # on updates) and flagged so a missing secret is easy to spot.
+          for pair in \
+            "GroqApiKey:GROQ_API_KEY" \
+            "NeonDatabaseUrl:NEON_DATABASE_URL" \
+            "SecretKey:SNOWY_SECRET_KEY" \
+            "PublicApiUrl:PUBLIC_API_URL"; do
+            name="${pair%%:*}"; var="${pair##*:}"
+            val="$(clean "${!var}")"
+            if [ -z "$val" ]; then
+              echo "::warning::Secret $var is empty or missing; $name not passed"
+            else
+              params+=("$name=$val")
+            fi
+          done
 
           add CohereApiKey          "$(clean "$COHERE_API_KEY")"
           add LocalLlmUrl           "$(clean "$LOCAL_LLM_URL")"
