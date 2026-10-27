@@ -1,14 +1,36 @@
 import asyncio
 import json
 import os
+import sys
 import time
 
 import asyncpg
 
 
 async def main():
-    database_url = os.environ["NEON_DATABASE_URL"]
-    profile = json.loads(os.environ["OWNER_PROFILE_JSON"])
+    database_url = os.environ.get("NEON_DATABASE_URL")
+    if not database_url:
+        sys.exit("Error: NEON_DATABASE_URL environment variable is not set.")
+
+    raw_profile = os.environ.get("OWNER_PROFILE_JSON", "").strip()
+    if not raw_profile:
+        sys.exit(
+            "Error: OWNER_PROFILE_JSON environment variable (or repository secret) is empty or not set.\n"
+            "Please configure the OWNER_PROFILE_JSON repository secret in GitHub with a valid JSON object, e.g.:\n"
+            '  {"name": "Your Name", "preferences": "..."}'
+        )
+
+    try:
+        profile = json.loads(raw_profile)
+    except json.JSONDecodeError as e:
+        sys.exit(
+            f"Error parsing OWNER_PROFILE_JSON: {e}.\n"
+            "Ensure OWNER_PROFILE_JSON contains a valid JSON object."
+        )
+
+    if not isinstance(profile, dict):
+        sys.exit("Error: OWNER_PROFILE_JSON must be a JSON object ({...}).")
+
     owner = os.environ.get("OWNER_ACCOUNT_ID", "owner")
 
     conn = await asyncpg.connect(database_url)

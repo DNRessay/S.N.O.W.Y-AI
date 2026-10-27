@@ -31,11 +31,11 @@ from pipeline.companion_intent import (
     format_companion_result,
     run_companion_intent,
 )
-from pipeline.orchestrator_intent import (
-    orchestrator_status_label,
-    detect_orchestrator_intent,
-    format_orchestrator_result,
-    run_orchestrator_intent,
+from pipeline.deepplan_intent import (
+    deepplan_status_label,
+    detect_deepplan_intent,
+    format_deepplan_result,
+    run_deepplan_intent,
 )
 from pipeline.google_intent import detect_google_intent, format_google_result, run_google_intent
 from pipeline.guide_intent import (
@@ -49,6 +49,12 @@ from pipeline.memory_search_intent import (
     format_memory_search_result,
     memory_search_status_label,
     run_memory_search_intent,
+)
+from pipeline.orchestrator_intent import (
+    detect_orchestrator_intent,
+    format_orchestrator_result,
+    orchestrator_status_label,
+    run_orchestrator_intent,
 )
 from pipeline.plan_continue import (
     continue_status_label,
@@ -64,12 +70,6 @@ from pipeline.repo_context import (
 )
 from pipeline.runs import durable
 from pipeline.session_title import generate_title
-from pipeline.deepplan_intent import (
-    detect_deepplan_intent,
-    format_deepplan_result,
-    run_deepplan_intent,
-    deepplan_status_label,
-)
 from pipeline.voice_stream import with_speech
 from pipeline.web_context import detect_web_intent, run_web_intent, status_label
 from storage.embeddings import embed_text
