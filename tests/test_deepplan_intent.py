@@ -1,10 +1,10 @@
 import pytest
 
 from pipeline.deepplan_intent import (
+    deepplan_status_label,
     detect_deepplan_intent,
     format_deepplan_result,
     run_deepplan_intent,
-    deepplan_status_label,
 )
 
 

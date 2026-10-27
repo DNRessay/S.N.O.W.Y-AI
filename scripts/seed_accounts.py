@@ -12,12 +12,28 @@ from gateway.passphrase import hash_passphrase  # noqa: E402
 
 
 async def main():
-    database_url = os.environ["NEON_DATABASE_URL"]
-    # A JSON array so more accounts can be added later just by editing this
-    # secret's value and re-running the workflow — no code or redeploy needed.
-    # e.g. [{"id": "owner", "passphrase": "...", "role": "owner"},
-    #       {"id": "someone-else", "passphrase": "...", "role": "guest"}]
-    accounts = json.loads(os.environ["OWNER_ACCOUNTS_JSON"])
+    database_url = os.environ.get("NEON_DATABASE_URL")
+    if not database_url:
+        sys.exit("Error: NEON_DATABASE_URL environment variable is not set.")
+
+    raw_accounts = os.environ.get("OWNER_ACCOUNTS_JSON", "").strip()
+    if not raw_accounts:
+        sys.exit(
+            "Error: OWNER_ACCOUNTS_JSON environment variable (or repository secret) is empty or not set.\n"
+            "Please configure the OWNER_ACCOUNTS_JSON repository secret in GitHub with a valid JSON array, e.g.:\n"
+            '  [{"id": "owner", "passphrase": "your-passphrase", "role": "owner"}]'
+        )
+
+    try:
+        accounts = json.loads(raw_accounts)
+    except json.JSONDecodeError as e:
+        sys.exit(
+            f"Error parsing OWNER_ACCOUNTS_JSON: {e}.\n"
+            "Ensure OWNER_ACCOUNTS_JSON contains a valid JSON array."
+        )
+
+    if not isinstance(accounts, list):
+        sys.exit("Error: OWNER_ACCOUNTS_JSON must be a JSON array ([{...}]).")
 
     conn = await asyncpg.connect(database_url)
     try:

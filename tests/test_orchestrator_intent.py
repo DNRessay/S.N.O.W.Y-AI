@@ -1,9 +1,9 @@
 import pytest
 
 from pipeline.orchestrator_intent import (
-    orchestrator_status_label,
     detect_orchestrator_intent,
     format_orchestrator_result,
+    orchestrator_status_label,
     run_orchestrator_intent,
 )
 
