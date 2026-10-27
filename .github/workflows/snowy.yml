@@ -2,15 +2,16 @@ name: SNOWY CI/CD
 
 on:
   push:
-    branches: ["claude/bold-hawking-8o28g3"]
+    branches: ["main", "claude/bold-hawking-8o28g3"]
     paths-ignore: ["frontend/**", "docs/**", "**.md"]
   pull_request:
-    branches: ["claude/bold-hawking-8o28g3"]
+    branches: ["main", "claude/bold-hawking-8o28g3"]
     paths-ignore: ["frontend/**", "docs/**", "**.md"]
   workflow_dispatch:
 
 env:
   PYTHON_VERSION: "3.13"
+  AWS_REGION_RESOLVED: ${{ secrets.AWS_REGION || 'eu-west-1' }}
 
 permissions:
   contents: read
@@ -43,46 +44,49 @@ jobs:
     name: Deploy to AWS (SAM)
     runs-on: ubuntu-latest
     needs: [lint-and-test]
-    if: github.ref == 'refs/heads/claude/bold-hawking-8o28g3' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    # Deploy on push / manual run from main or the feature branch; never on PRs.
+    if: >-
+      (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/claude/bold-hawking-8o28g3')
+      && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    concurrency:
+      group: deploy-snowy
+      cancel-in-progress: false
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@v4
 
-      - name: Configure AWS credentials (IAM user access key)
+      - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.AWS_REGION || 'eu-west-1' }}
+          aws-region: ${{ env.AWS_REGION_RESOLVED }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
+      # SAM CLI is preinstalled on ubuntu-latest; no install step needed.
       - name: Verify AWS SAM CLI
-        # There was never anything to install: GitHub's ubuntu-latest runner
-        # image ships AWS SAM CLI preinstalled (confirmed by the standalone
-        # installer itself refusing to proceed — "Found preexisting AWS SAM
-        # CLI installation: /usr/local/aws-sam-cli/current"). Both
-        # `pip install aws-sam-cli` variants that hung 5 runs in a row were
-        # redundant work fighting PyPI reachability for a tool already on
-        # the runner; this just confirms it's there.
         run: sam --version
 
       - name: sam build
-        # --use-container builds inside a Docker container matching the
-        # Lambda runtime — needed when the machine building doesn't match
-        # that runtime (e.g. an arm64 dev laptop targeting x86_64 Lambda).
-        # That's not the case here: the runner is already x86_64 Linux via
-        # actions/setup-python, the same architecture template.yaml targets
-        # (Architectures: [x86_64]), so there's nothing left to cross-build
-        # for — only a Docker image pull to hang on, which it just did.
         run: sam build
+
+      - name: Mask public URL in logs
+        env:
+          PUBLIC_API_URL: ${{ secrets.PUBLIC_API_URL }}
+        run: |
+          url="${PUBLIC_API_URL%/}"
+          host="${url#https://}"; host="${host%%/*}"
+          echo "::add-mask::$url"
+          echo "::add-mask::$host"
 
       - name: sam deploy
         env:
+          PUBLIC_API_URL: ${{ secrets.PUBLIC_API_URL }}
           SNOWY_ENABLED: ${{ vars.SNOWY_ENABLED || secrets.SNOWY_ENABLED }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           COHERE_API_KEY: ${{ secrets.COHERE_API_KEY }}
@@ -109,15 +113,13 @@ jobs:
           WHATSAPP_TOKEN: ${{ secrets.WHATSAPP_TOKEN }}
           WHATSAPP_PHONE_ID: ${{ secrets.WHATSAPP_PHONE_ID }}
           WHATSAPP_VERIFY_TOKEN: ${{ secrets.WHATSAPP_VERIFY_TOKEN }}
-          GITHUB_WEBHOOK_SECRET: ${{ secrets.GH_WEBHOOK_SECRET }}
+          GH_WEBHOOK_SECRET: ${{ secrets.GH_WEBHOOK_SECRET }}
           OPENCLAW_URL: ${{ secrets.OPENCLAW_URL }}
           OPENCLAW_WEBHOOK_SECRET: ${{ secrets.OPENCLAW_WEBHOOK_SECRET }}
           WHATSAPP_APP_SECRET: ${{ secrets.WHATSAPP_APP_SECRET }}
           RESET_EMAILS: ${{ secrets.RESET_EMAILS }}
           SES_FROM_EMAIL: ${{ secrets.SES_FROM_EMAIL }}
           MCP_SERVERS: ${{ secrets.MCP_SERVERS }}
-          # Secret name can't start with GITHUB_ — GitHub Actions reserves
-          # that prefix for its own built-in secrets and refuses to save one.
           GH_OAUTH_CLIENT_ID: ${{ secrets.GH_OAUTH_CLIENT_ID }}
           GH_OAUTH_CLIENT_SECRET: ${{ secrets.GH_OAUTH_CLIENT_SECRET }}
           GITLAB_OAUTH_CLIENT_ID: ${{ secrets.GITLAB_OAUTH_CLIENT_ID }}
@@ -125,125 +127,71 @@ jobs:
           GOOGLE_OAUTH_CLIENT_ID: ${{ secrets.GOOGLE_OAUTH_CLIENT_ID }}
           GOOGLE_OAUTH_CLIENT_SECRET: ${{ secrets.GOOGLE_OAUTH_CLIENT_SECRET }}
         run: |
-          # Secrets go through env vars (not string-interpolated straight into
-          # the script) and get trimmed + individually quoted below. Directly
-          # interpolating ${{ secrets.X }} unquoted into a multi-line shell
-          # command — the previous version of this step — meant a secret with
-          # so much as a trailing newline (a common copy-paste artifact, e.g.
-          # from a database dashboard's "connection string" field) silently
-          # truncated the whole command: everything after the newline became
-          # a separate, harmless no-op shell statement instead of erroring,
-          # so sam deploy "succeeded" while quietly deploying nothing.
-          # Master switch: only an explicit false/off/0/no turns SNOWY off; unset means on.
+          # Strip CR/LF from secrets (copy-paste artifacts truncate commands).
+          clean() { printf '%s' "$1" | tr -d '\r\n'; }
+
+          # Optional params are skipped when empty: sam rejects "Key=".
+          params=()
+          add() { if [ -n "$2" ]; then params+=("$1=$2"); fi; }
+
           case "$(printf '%s' "$SNOWY_ENABLED" | tr -d '\r\n ' | tr 'A-Z' 'a-z')" in
             false|off|0|no) snowy_enabled=false ;;
             *) snowy_enabled=true ;;
           esac
           echo "SNOWY_ENABLED -> ${snowy_enabled}"
-          groq_api_key=$(printf '%s' "$GROQ_API_KEY" | tr -d '\r\n')
-          cohere_api_key=$(printf '%s' "$COHERE_API_KEY" | tr -d '\r\n')
-          local_llm_url=$(printf '%s' "$LOCAL_LLM_URL" | tr -d '\r\n')
-          local_llm_api_key=$(printf '%s' "$LOCAL_LLM_API_KEY" | tr -d '\r\n')
-          gemini_api_key=$(printf '%s' "$GEMINI_API_KEY" | tr -d '\r\n')
-          anthropic_api_key=$(printf '%s' "$ANTHROPIC_API_KEY" | tr -d '\r\n')
-          openai_api_key=$(printf '%s' "$OPENAI_API_KEY" | tr -d '\r\n')
-          qwen_api_key=$(printf '%s' "$QWEN_API_KEY" | tr -d '\r\n')
-          deepseek_api_key=$(printf '%s' "$DEEPSEEK_API_KEY" | tr -d '\r\n')
-          kimi_api_key=$(printf '%s' "$KIMI_API_KEY" | tr -d '\r\n')
-          hf_token=$(printf '%s' "$HF_TOKEN" | tr -d '\r\n')
-          modal_video_url=$(printf '%s' "$MODAL_VIDEO_URL" | tr -d '\r\n')
-          modal_video_secret=$(printf '%s' "$MODAL_VIDEO_SECRET" | tr -d '\r\n')
-          searxng_url=$(printf '%s' "$SEARXNG_URL" | tr -d '\r\n')
-          owner_whatsapp_number=$(printf '%s' "$OWNER_WHATSAPP_NUMBER" | tr -d '\r\n')
-          pulse_brief_hour=$(printf '%s' "$PULSE_BRIEF_HOUR" | tr -d '\r\n')
-          neon_database_url=$(printf '%s' "$NEON_DATABASE_URL" | tr -d '\r\n')
-          modal_embeddings_url=$(printf '%s' "$MODAL_EMBEDDINGS_URL" | tr -d '\r\n')
-          modal_repo_url=$(printf '%s' "$MODAL_REPO_URL" | tr -d '\r\n')
-          modal_repo_secret=$(printf '%s' "$MODAL_REPO_SECRET" | tr -d '\r\n')
-          secret_key=$(printf '%s' "$SNOWY_SECRET_KEY" | tr -d '\r\n')
-          serp_api_key=$(printf '%s' "$SERP_API_KEY" | tr -d '\r\n')
-          whatsapp_token=$(printf '%s' "$WHATSAPP_TOKEN" | tr -d '\r\n')
-          whatsapp_phone_id=$(printf '%s' "$WHATSAPP_PHONE_ID" | tr -d '\r\n')
-          whatsapp_verify_token=$(printf '%s' "$WHATSAPP_VERIFY_TOKEN" | tr -d '\r\n')
-          github_webhook_secret=$(printf '%s' "$GITHUB_WEBHOOK_SECRET" | tr -d '\r\n')
-          openclaw_url=$(printf '%s' "$OPENCLAW_URL" | tr -d '\r\n')
-          openclaw_webhook_secret=$(printf '%s' "$OPENCLAW_WEBHOOK_SECRET" | tr -d '\r\n')
-          whatsapp_app_secret=$(printf '%s' "$WHATSAPP_APP_SECRET" | tr -d '\r\n')
-          reset_emails=$(printf '%s' "$RESET_EMAILS" | tr -d '\r\n ' | tr ',' ';')
-          ses_from_email=$(printf '%s' "$SES_FROM_EMAIL" | tr -d '\r\n')
-          mcp_servers=$(printf '%s' "$MCP_SERVERS" | tr -d '\r\n')
-          github_oauth_client_id=$(printf '%s' "$GH_OAUTH_CLIENT_ID" | tr -d '\r\n')
-          github_oauth_client_secret=$(printf '%s' "$GH_OAUTH_CLIENT_SECRET" | tr -d '\r\n')
-          gitlab_oauth_client_id=$(printf '%s' "$GITLAB_OAUTH_CLIENT_ID" | tr -d '\r\n')
-          gitlab_oauth_client_secret=$(printf '%s' "$GITLAB_OAUTH_CLIENT_SECRET" | tr -d '\r\n')
-          google_oauth_client_id=$(printf '%s' "$GOOGLE_OAUTH_CLIENT_ID" | tr -d '\r\n')
-          google_oauth_client_secret=$(printf '%s' "$GOOGLE_OAUTH_CLIENT_SECRET" | tr -d '\r\n')
 
-          # sam deploy's --parameter-overrides shorthand rejects "Key=" with a
-          # truly empty value ("not a valid format") — so optional params that
-          # are unset get left out entirely rather than passed as empty; the
-          # template's own Default: "" covers them the same way either way.
-          #
-          # GroqModel/GroqPlanningModel/CohereModel are passed explicitly,
-          # always, even though they're not secrets — CloudFormation reuses
-          # a parameter's *previous deployed value* for any parameter
-          # omitted from --parameter-overrides on a stack update, not the
-          # template's current Default. Two model-ID fixes both silently
-          # no-op'd for exactly this reason before this was caught. Keep
-          # these literal values in sync with the Default: in template.yaml.
-          # PublicApiUrl is this stack's own ChatFunctionUrl — stable once
-          # created (Function URLs don't change across in-place updates,
-          # confirmed repeatedly this session), so it's safe to hardcode
-          # rather than needing a secret for it.
-          params=(
+          # Always passed: CloudFormation reuses the previous deployed value
+          # for omitted params, so keep model IDs in sync with template.yaml.
+          params+=(
             "SnowyEnabled=${snowy_enabled}"
-            "GroqApiKey=${groq_api_key}"
-            "NeonDatabaseUrl=${neon_database_url}"
-            "SecretKey=${secret_key}"
+            "GroqApiKey=$(clean "$GROQ_API_KEY")"
+            "NeonDatabaseUrl=$(clean "$NEON_DATABASE_URL")"
+            "SecretKey=$(clean "$SNOWY_SECRET_KEY")"
             "GroqModel=qwen/qwen3.8-27b"
             "GroqPlanningModel=openai/gpt-oss-120b"
             "CohereModel=command-a-03-2025"
-            "PublicApiUrl=https://sv2uw47le4udr57ojay37ey3ry0nssoa.lambda-url.eu-west-1.on.aws"
+            "PublicApiUrl=$(clean "$PUBLIC_API_URL")"
           )
-          [ -n "$cohere_api_key" ] && params+=("CohereApiKey=${cohere_api_key}")
-          [ -n "$local_llm_url" ] && params+=("LocalLlmUrl=${local_llm_url}")
-          [ -n "$local_llm_api_key" ] && params+=("LocalLlmApiKey=${local_llm_api_key}")
-          [ -n "$gemini_api_key" ] && params+=("GeminiApiKey=${gemini_api_key}")
-          [ -n "$anthropic_api_key" ] && params+=("AnthropicApiKey=${anthropic_api_key}")
-          [ -n "$openai_api_key" ] && params+=("OpenaiApiKey=${openai_api_key}")
-          [ -n "$qwen_api_key" ] && params+=("QwenApiKey=${qwen_api_key}")
-          [ -n "$deepseek_api_key" ] && params+=("DeepseekApiKey=${deepseek_api_key}")
-          [ -n "$kimi_api_key" ] && params+=("KimiApiKey=${kimi_api_key}")
-          [ -n "$hf_token" ] && params+=("HfToken=${hf_token}")
-          [ -n "$modal_video_url" ] && params+=("ModalVideoUrl=${modal_video_url}")
-          [ -n "$modal_video_secret" ] && params+=("ModalVideoSecret=${modal_video_secret}")
-          [ -n "$searxng_url" ] && params+=("SearxngUrl=${searxng_url}")
-          [ -n "$owner_whatsapp_number" ] && params+=("OwnerWhatsappNumber=${owner_whatsapp_number}")
-          [ -n "$pulse_brief_hour" ] && params+=("PulseBriefHour=${pulse_brief_hour}")
-          [ -n "$modal_embeddings_url" ] && params+=("ModalEmbeddingsUrl=${modal_embeddings_url}")
-          [ -n "$modal_repo_url" ] && params+=("ModalRepoUrl=${modal_repo_url}")
-          [ -n "$modal_repo_secret" ] && params+=("ModalRepoSecret=${modal_repo_secret}")
-          [ -n "$serp_api_key" ] && params+=("SerpApiKey=${serp_api_key}")
-          [ -n "$whatsapp_token" ] && params+=("WhatsappToken=${whatsapp_token}")
-          [ -n "$whatsapp_phone_id" ] && params+=("WhatsappPhoneId=${whatsapp_phone_id}")
-          [ -n "$whatsapp_verify_token" ] && params+=("WhatsappVerifyToken=${whatsapp_verify_token}")
-          [ -n "$github_webhook_secret" ] && params+=("GithubWebhookSecret=${github_webhook_secret}")
-          [ -n "$openclaw_url" ] && params+=("OpenclawUrl=${openclaw_url}")
-          [ -n "$openclaw_webhook_secret" ] && params+=("OpenclawWebhookSecret=${openclaw_webhook_secret}")
-          [ -n "$whatsapp_app_secret" ] && params+=("WhatsappAppSecret=${whatsapp_app_secret}")
-          [ -n "$reset_emails" ] && params+=("ResetEmails=${reset_emails}")
-          [ -n "$ses_from_email" ] && params+=("SesFromEmail=${ses_from_email}")
-          [ -n "$mcp_servers" ] && params+=("McpServers=${mcp_servers}")
-          [ -n "$github_oauth_client_id" ] && params+=("GithubClientId=${github_oauth_client_id}")
-          [ -n "$github_oauth_client_secret" ] && params+=("GithubClientSecret=${github_oauth_client_secret}")
-          [ -n "$gitlab_oauth_client_id" ] && params+=("GitlabClientId=${gitlab_oauth_client_id}")
-          [ -n "$gitlab_oauth_client_secret" ] && params+=("GitlabClientSecret=${gitlab_oauth_client_secret}")
-          [ -n "$google_oauth_client_id" ] && params+=("GoogleClientId=${google_oauth_client_id}")
-          [ -n "$google_oauth_client_secret" ] && params+=("GoogleClientSecret=${google_oauth_client_secret}")
+
+          add CohereApiKey          "$(clean "$COHERE_API_KEY")"
+          add LocalLlmUrl           "$(clean "$LOCAL_LLM_URL")"
+          add LocalLlmApiKey        "$(clean "$LOCAL_LLM_API_KEY")"
+          add GeminiApiKey          "$(clean "$GEMINI_API_KEY")"
+          add AnthropicApiKey       "$(clean "$ANTHROPIC_API_KEY")"
+          add OpenaiApiKey          "$(clean "$OPENAI_API_KEY")"
+          add QwenApiKey            "$(clean "$QWEN_API_KEY")"
+          add DeepseekApiKey        "$(clean "$DEEPSEEK_API_KEY")"
+          add KimiApiKey            "$(clean "$KIMI_API_KEY")"
+          add HfToken               "$(clean "$HF_TOKEN")"
+          add ModalVideoUrl         "$(clean "$MODAL_VIDEO_URL")"
+          add ModalVideoSecret      "$(clean "$MODAL_VIDEO_SECRET")"
+          add SearxngUrl            "$(clean "$SEARXNG_URL")"
+          add OwnerWhatsappNumber   "$(clean "$OWNER_WHATSAPP_NUMBER")"
+          add PulseBriefHour        "$(clean "$PULSE_BRIEF_HOUR")"
+          add ModalEmbeddingsUrl    "$(clean "$MODAL_EMBEDDINGS_URL")"
+          add ModalRepoUrl          "$(clean "$MODAL_REPO_URL")"
+          add ModalRepoSecret       "$(clean "$MODAL_REPO_SECRET")"
+          add SerpApiKey            "$(clean "$SERP_API_KEY")"
+          add WhatsappToken         "$(clean "$WHATSAPP_TOKEN")"
+          add WhatsappPhoneId       "$(clean "$WHATSAPP_PHONE_ID")"
+          add WhatsappVerifyToken   "$(clean "$WHATSAPP_VERIFY_TOKEN")"
+          add GithubWebhookSecret   "$(clean "$GH_WEBHOOK_SECRET")"
+          add OpenclawUrl           "$(clean "$OPENCLAW_URL")"
+          add OpenclawWebhookSecret "$(clean "$OPENCLAW_WEBHOOK_SECRET")"
+          add WhatsappAppSecret     "$(clean "$WHATSAPP_APP_SECRET")"
+          add ResetEmails           "$(printf '%s' "$RESET_EMAILS" | tr -d '\r\n ' | tr ',' ';')"
+          add SesFromEmail          "$(clean "$SES_FROM_EMAIL")"
+          add McpServers            "$(clean "$MCP_SERVERS")"
+          add GithubClientId        "$(clean "$GH_OAUTH_CLIENT_ID")"
+          add GithubClientSecret    "$(clean "$GH_OAUTH_CLIENT_SECRET")"
+          add GitlabClientId        "$(clean "$GITLAB_OAUTH_CLIENT_ID")"
+          add GitlabClientSecret    "$(clean "$GITLAB_OAUTH_CLIENT_SECRET")"
+          add GoogleClientId        "$(clean "$GOOGLE_OAUTH_CLIENT_ID")"
+          add GoogleClientSecret    "$(clean "$GOOGLE_OAUTH_CLIENT_SECRET")"
 
           sam deploy \
             --debug \
-            --region "${{ secrets.AWS_REGION || 'eu-west-1' }}" \
+            --region "$AWS_REGION_RESOLVED" \
             --no-confirm-changeset \
             --no-fail-on-empty-changeset \
             --parameter-overrides "${params[@]}"
@@ -251,25 +199,17 @@ jobs:
       - name: Diagnose changeset failure
         if: failure()
         run: |
-          region="${{ secrets.AWS_REGION || 'eu-west-1' }}"
-          echo "--- list-change-sets ---"
+          region="$AWS_REGION_RESOLVED"
           aws cloudformation list-change-sets --stack-name snowy --region "$region" || true
           latest=$(aws cloudformation list-change-sets --stack-name snowy --region "$region" \
             --query 'reverse(sort_by(Summaries, &CreationTime))[0].ChangeSetId' --output text 2>/dev/null || true)
           if [ -n "$latest" ] && [ "$latest" != "None" ]; then
-            echo "--- describe-change-set: $latest ---"
             aws cloudformation describe-change-set --stack-name snowy --region "$region" --change-set-name "$latest" || true
           fi
-          echo "--- describe-stack-events (last 10) ---"
           aws cloudformation describe-stack-events --stack-name snowy --region "$region" --max-items 10 || true
-          echo "--- describe-events (last 20; covers real stack operations only, not failed changeset creation) ---"
           aws cloudformation describe-events --stack-name snowy --region "$region" --max-items 20 || true
 
-      - name: Expire old build artifacts in the SAM deployment bucket
-        # `sam deploy --resolve-s3` keeps every historical build zip forever
-        # by default. Idempotent — re-applies the same 14-day expiry rule on
-        # every deploy, matching the CloudWatch log retention in template.yaml,
-        # so this bucket never becomes a slow, silent storage cost.
+      - name: Expire old build artifacts (14 days)
         run: |
           BUCKET=$(aws cloudformation describe-stacks \
             --stack-name aws-sam-cli-managed-default \
@@ -288,63 +228,39 @@ jobs:
             }'
 
       - name: Smoke test deployed endpoint
-        # Confirms the Function URL is actually serving the FastAPI app —
-        # a routing/startup regression would silently 404 or hang instead
-        # of failing the deploy itself, since CloudFormation only checks
-        # that the *resources* converged, not that the app inside answers
-        # correctly. Kept from the (reverted) streaming attempt since it's
-        # cheap, real regression coverage regardless of invoke mode.
         run: |
-          region="${{ secrets.AWS_REGION || 'eu-west-1' }}"
+          region="$AWS_REGION_RESOLVED"
           url=$(aws cloudformation describe-stacks --stack-name snowy --region "$region" \
             --query "Stacks[0].Outputs[?OutputKey=='ChatFunctionUrl'].OutputValue" --output text)
           url="${url%/}"
+          host="${url#https://}"; host="${host%%/*}"
+          echo "::add-mask::$url"
+          echo "::add-mask::$host"
 
-          echo "Testing $url/health"
-          health_status=$(curl -s -o /tmp/health_body.txt -w "%{http_code}" "$url/health")
-          echo "status=$health_status body=$(cat /tmp/health_body.txt)"
-          if [ "$health_status" != "200" ]; then
-            echo "::error::/health returned $health_status, expected 200"
-            exit 1
-          fi
+          echo "GET $url/health"
+          status=$(curl -s -o /tmp/body.txt -w "%{http_code}" "$url/health")
+          echo "status=$status body=$(cat /tmp/body.txt)"
+          [ "$status" = "200" ] || { echo "::error::/health returned $status, expected 200"; exit 1; }
 
-          echo "Testing POST $url/auth/login (expect 401, confirms routing works)"
-          login_status=$(curl -s -o /tmp/login_body.txt -w "%{http_code}" -X POST "$url/auth/login" \
+          echo "POST $url/auth/login (expect 401)"
+          status=$(curl -s -o /tmp/body.txt -w "%{http_code}" -X POST "$url/auth/login" \
             -H "Content-Type: application/json" -d '{"passphrase":"__smoke_test_wrong__"}')
-          echo "status=$login_status body=$(cat /tmp/login_body.txt)"
-          if [ "$login_status" != "401" ]; then
-            echo "::error::/auth/login returned $login_status, expected 401 (route may be missing/misconfigured)"
-            exit 1
-          fi
+          echo "status=$status body=$(cat /tmp/body.txt)"
+          [ "$status" = "401" ] || { echo "::error::/auth/login returned $status, expected 401"; exit 1; }
 
-          # A plain curl POST above never sends an Origin header, so it never
-          # triggers the browser's CORS preflight — a real frontend request
-          # does. Simulate that preflight explicitly, since a genuine browser
-          # login attempt is failing with "Not Found" despite the direct POST
-          # above working fine, and this is the one code path curl alone
-          # can't reach.
-          echo "Testing OPTIONS $url/auth/login (CORS preflight, as a browser would send it)"
-          preflight_status=$(curl -s -o /tmp/preflight_body.txt -w "%{http_code}" -X OPTIONS "$url/auth/login" \
-            -H "Origin: https://snowy.pages.dev" \
-            -H "Access-Control-Request-Method: POST" \
+          echo "OPTIONS $url/auth/login (CORS preflight)"
+          preflight_args=(-X OPTIONS "$url/auth/login"
+            -H "Origin: https://snowy.pages.dev"
+            -H "Access-Control-Request-Method: POST"
             -H "Access-Control-Request-Headers: content-type")
-          preflight_headers=$(curl -s -D - -o /dev/null -X OPTIONS "$url/auth/login" \
-            -H "Origin: https://snowy.pages.dev" \
-            -H "Access-Control-Request-Method: POST" \
-            -H "Access-Control-Request-Headers: content-type")
-          echo "status=$preflight_status body=$(cat /tmp/preflight_body.txt)"
-          echo "headers: $preflight_headers"
-          if [ "$preflight_status" -ge 300 ]; then
-            echo "::error::OPTIONS preflight on /auth/login returned $preflight_status — this is likely why real browser logins fail"
-            exit 1
-          fi
+          status=$(curl -s -o /tmp/body.txt -w "%{http_code}" "${preflight_args[@]}")
+          echo "status=$status headers:"
+          curl -s -D - -o /dev/null "${preflight_args[@]}"
+          [ "$status" -lt 300 ] || { echo "::error::CORS preflight returned $status"; exit 1; }
 
           for path in /connectors /skills; do
-            echo "Testing GET $url$path (expect 401 unauthenticated, confirms routing works)"
-            status=$(curl -s -o /tmp/route_body.txt -w "%{http_code}" "$url$path")
-            echo "status=$status body=$(cat /tmp/route_body.txt)"
-            if [ "$status" != "401" ]; then
-              echo "::error::$path returned $status, expected 401 (route may be missing/misconfigured)"
-              exit 1
-            fi
+            echo "GET $url$path (expect 401)"
+            status=$(curl -s -o /tmp/body.txt -w "%{http_code}" "$url$path")
+            echo "status=$status body=$(cat /tmp/body.txt)"
+            [ "$status" = "401" ] || { echo "::error::$path returned $status, expected 401"; exit 1; }
           done
